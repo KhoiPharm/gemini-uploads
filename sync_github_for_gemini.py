@@ -450,6 +450,16 @@ def build_task_action(launcher: Path) -> str:
     return f'wscript.exe //B //Nologo "{launcher}"'
 
 
+def validate_task_action(action: str) -> None:
+    """Fail with a clear message before schtasks rejects an overlong /TR value."""
+    if len(action) > MAX_SCHTASKS_ACTION_CHARS:
+        raise RuntimeError(
+            "Windows Task Scheduler cannot store the background launcher because its path is too long. "
+            f"Task action length is {len(action)} characters; limit is {MAX_SCHTASKS_ACTION_CHARS}. "
+            "Use a shorter Windows user/local-app-data path or configure a shorter runtime path."
+        )
+
+
 def build_task_registration_args(task_name: str, action: str) -> list[str]:
     """Return schtasks arguments separately so Windows task setup is testable."""
     return [
@@ -469,12 +479,7 @@ def register_background_task(profile_id: str, profiles_path: Path) -> None:
     launcher = write_hidden_launcher(profile_id, profiles_path, pythonw, runtime_script)
     task_name = task_name_for(profile_id)
     action = build_task_action(launcher)
-    if len(action) > MAX_SCHTASKS_ACTION_CHARS:
-        raise RuntimeError(
-            "Windows Task Scheduler cannot store the background launcher because its path is too long. "
-            f"Task action length is {len(action)} characters; limit is {MAX_SCHTASKS_ACTION_CHARS}. "
-            "Move the Windows user profile/local-app-data path to a shorter location or configure a shorter runtime path."
-        )
+    validate_task_action(action)
     cmd = build_task_registration_args(task_name, action)
     proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
     if proc.returncode != 0:
