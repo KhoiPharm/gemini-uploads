@@ -261,6 +261,11 @@ class SyncTests(unittest.TestCase):
         self.assertLess(len(action), 260)
         self.assertIn('"', action)
 
+    def test_windows_task_action_rejects_overlong_command(self) -> None:
+        action = "x" * (sync.MAX_SCHTASKS_ACTION_CHARS + 1)
+        with self.assertRaisesRegex(RuntimeError, "path is too long"):
+            sync.validate_task_action(action)
+
     def test_update_add_modify_delete(self) -> None:
         self.assertEqual(self.run_sync().returncode, 0)
         (self.work / "src" / "app.py").write_text("print('v2')\n", encoding="utf-8")
