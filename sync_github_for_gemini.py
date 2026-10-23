@@ -931,11 +931,13 @@ def interactive_setup(profiles_path: Path) -> str:
     mirror = str(local_app_dir() / MIRROR_DIR_NAME / pid)
     exact_output = expand_path(output)
     gemini_output = exact_output.with_name(exact_output.name + "-Gemini")
+    gemini_start = exact_output.with_name(exact_output.name + "-Gemini-Start")
     profiles[pid] = {
         "source_repo": source,
         "branch": branch,
         "output_dir": output,
         "gemini_output_dir": str(gemini_output),
+        "gemini_start_output_dir": str(gemini_start),
         "mirror_dir": mirror,
     }
     save_profiles(profiles_path, profiles)
@@ -946,7 +948,8 @@ def interactive_setup(profiles_path: Path) -> str:
     register_background_task(pid, profiles_path)
     print("\n[DONE] You can close this window.")
     print("From now on Windows will refresh this repository silently in the background.")
-    print(f"Upload this folder to Gemini: {gemini_output}")
+    print(f"Upload this folder FIRST: {gemini_start}")
+    print(f"When Gemini asks for code, attach the requested files from: {gemini_output}")
     print("Run SetupGeminiRepo.bat again only if you want to add another repository.")
     return pid
 
@@ -1015,9 +1018,11 @@ def main() -> int:
             for pid, profile in sorted(profiles.items()):
                 exact = expand_path(str(profile.get("output_dir") or ""))
                 gemini = gemini_bundle_output_dir(profile, exact)
+                starter = gemini_start_output_dir(profile, exact)
                 print(
                     f"{pid}\n  {redact_remote_credentials(str(profile.get('source_repo') or ''))} "
-                    f"[{profile.get('branch', 'main')}]\n  exact -> {exact}\n  Gemini -> {gemini}"
+                    f"[{profile.get('branch', 'main')}]\n  exact -> {exact}\n"
+                    f"  starter -> {starter}\n  bundles -> {gemini}"
                 )
             return 0
 
