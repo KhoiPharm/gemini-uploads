@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -34,6 +35,7 @@ TASK_PREFIX = "GeminiRepoSync-"
 SYNC_INTERVAL_MINUTES = 2
 MAX_UPLOAD_FILE_BYTES = 100 * 1024 * 1024
 MAX_LOG_BYTES = 2 * 1024 * 1024
+BACKGROUND_GIT_TIMEOUT_SECONDS = 90
 
 BACKGROUND_MODE = False
 
@@ -127,6 +129,11 @@ def normalized_remote(value: str) -> str:
     return value.rstrip("/\\").removesuffix(".git").lower()
 
 
+def redact_remote_credentials(message: str) -> str:
+    """Remove URL user-info before Git diagnostics are printed or logged."""
+    return re.sub(r"(?i)(https?://)[^/@\s]+@", r"\1[credentials]@", message)
+
+
 def validate_output_dir(output: Path, mirror: Path) -> None:
     output = output.resolve()
     mirror = mirror.resolve()
@@ -159,6 +166,9 @@ def run_git(args: list[str], cwd: Path | None = None, *, text: bool = True) -> s
     env = os.environ.copy()
     if BACKGROUND_MODE:
         env["GIT_TERMINAL_PROMPT"] = "0"
+        # Git Credential Manager honors this and will fail instead of waiting
+        # for an authentication UI that is hidden behind pythonw.exe.
+        env["GCM_INTERACTIVE"] = "never"
     try:
         proc = subprocess.run(
             cmd,
@@ -171,12 +181,19 @@ def run_git(args: list[str], cwd: Path | None = None, *, text: bool = True) -> s
             check=False,
             env=env,
             creationflags=_creation_flags(),
+            timeout=BACKGROUND_GIT_TIMEOUT_SECONDS if BACKGROUND_MODE else None,
         )
     except FileNotFoundError as exc:
         raise RuntimeError("Git was not found. Install Git for Windows and try again.") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"Git did not finish within {BACKGROUND_GIT_TIMEOUT_SECONDS} seconds. "
+            "The background sync will retry on its next scheduled run."
+        ) from exc
     if proc.returncode != 0:
         stderr = proc.stderr.strip() if text else proc.stderr.decode("utf-8", "replace").strip()
-        raise RuntimeError(f"Git command failed: {' '.join(cmd)}\n{stderr}")
+        stderr = redact_remote_credentials(stderr)
+        raise RuntimeError(f"Git command failed ({cmd[1] if len(cmd) > 1 else 'git'}):\n{stderr}")
     return proc.stdout.strip() if text else proc.stdout
 
 
@@ -220,7 +237,8 @@ def ensure_mirror(source: str, branch: str, mirror: Path, *, reclone: bool = Fal
     if normalized_remote(current_remote) != normalized_remote(source):
         raise RuntimeError(
             "The disposable mirror points to a different repository.\n"
-            f"Configured: {source}\nMirror origin: {current_remote}\n"
+            f"Configured: {redact_remote_credentials(source)}\n"
+            f"Mirror origin: {redact_remote_credentials(current_remote)}\n"
             "Run with --reclone to rebuild only the disposable mirror."
         )
 
@@ -245,8 +263,23 @@ def materialize_tracked_files(mirror: Path, output: Path) -> tuple[int, list[str
     parent = output.parent
     parent.mkdir(parents=True, exist_ok=True)
 
+    # Recover a known-good output left under its backup name if a previous
+    # process was interrupted between the two directory renames.
+    if not output.exists():
+        backups = list(parent.glob(f".{output.name}.previous-*"))
+        backups.sort(key=lambda path: path.stat().st_mtime if path.exists() else 0, reverse=True)
+        for previous in backups:
+            try:
+                previous.rename(output)
+                print(f"[INFO] Restored prior output before refresh: {output}")
+                break
+            except OSError:
+                continue
+
     staging = parent / f".{output.name}.staging-{uuid.uuid4().hex[:8]}"
-    backup = parent / f".{output.name}.previous"
+    # A unique backup means a locked folder left by a prior run cannot prevent
+    # a later run from staging a fresh snapshot.
+    backup = parent / f".{output.name}.previous-{uuid.uuid4().hex[:8]}"
     staging.mkdir(parents=True, exist_ok=False)
     oversized: list[str] = []
 
@@ -264,9 +297,6 @@ def materialize_tracked_files(mirror: Path, output: Path) -> tuple[int, list[str
             except OSError:
                 pass
 
-        if backup.exists():
-            shutil.rmtree(backup)
-
         moved_old = False
         if output.exists():
             output.rename(backup)
@@ -279,7 +309,19 @@ def materialize_tracked_files(mirror: Path, output: Path) -> tuple[int, list[str
             raise
 
         if backup.exists():
-            shutil.rmtree(backup)
+            try:
+                shutil.rmtree(backup)
+            except OSError as exc:
+                print(f"[WARNING] New output is ready; old folder cleanup will be retried later: {exc}")
+        for stale_backup in parent.glob(f".{output.name}.previous-*"):
+            if stale_backup == backup:
+                continue
+            try:
+                shutil.rmtree(stale_backup)
+            except OSError:
+                # Drive, Explorer, or antivirus may still be holding an old
+                # folder open. Keep it and try again after a later refresh.
+                pass
     finally:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
@@ -386,12 +428,22 @@ def write_hidden_launcher(profile_id: str, profiles_path: Path, pythonw: Path, r
         'Set shell = CreateObject("WScript.Shell")\n'
         f'shell.Run "{vbs_quote(command)}", 0, False\n'
     )
-    launcher.write_text(content, encoding="utf-8")
+    # WSH must read non-ASCII usernames and folder names correctly.
+    launcher.write_text(content, encoding="utf-16")
     return launcher
 
 
 def build_task_action(launcher: Path) -> str:
     return f'wscript.exe //B //Nologo "{launcher}"'
+
+
+def build_task_registration_args(task_name: str, action: str) -> list[str]:
+    """Return schtasks arguments separately so Windows task setup is testable."""
+    return [
+        "schtasks.exe", "/Create", "/TN", task_name, "/TR", action,
+        "/SC", "MINUTE", "/MO", str(SYNC_INTERVAL_MINUTES),
+        "/IT", "/RL", "LIMITED", "/F",
+    ]
 
 
 def register_background_task(profile_id: str, profiles_path: Path) -> None:
@@ -404,22 +456,7 @@ def register_background_task(profile_id: str, profiles_path: Path) -> None:
     launcher = write_hidden_launcher(profile_id, profiles_path, pythonw, runtime_script)
     task_name = task_name_for(profile_id)
     action = build_task_action(launcher)
-    cmd = [
-        "schtasks.exe",
-        "/Create",
-        "/TN",
-        task_name,
-        "/TR",
-        action,
-        "/SC",
-        "MINUTE",
-        "/MO",
-        str(SYNC_INTERVAL_MINUTES),
-        "/IT",
-        "/RL",
-        "LIMITED",
-        "/F",
-    ]
+    cmd = build_task_registration_args(task_name, action)
     proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
     if proc.returncode != 0:
         raise RuntimeError(f"Could not register Windows background task:\n{proc.stderr.strip() or proc.stdout.strip()}")
