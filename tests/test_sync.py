@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import io
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -31,6 +32,7 @@ class SyncTests(unittest.TestCase):
         self.remote = self.root / "remote.git"
         self.mirror = self.root / "mirror clone"
         self.output = self.root / "Gemini upload output"
+        self.gemini_output = self.root / "Gemini upload output-Gemini"
         self.config = self.root / "profiles config.json"
 
         subprocess.run(["git", "init", "--bare", str(self.remote)], check=True, capture_output=True)
@@ -77,6 +79,74 @@ class SyncTests(unittest.TestCase):
         self.assertEqual((self.output / "src" / "app.py").read_text(encoding="utf-8"), "print('v1')\n")
         self.assertTrue((self.output / "README.md").exists())
         self.assertFalse((self.output / ".git").exists())
+
+    def test_first_sync_creates_gemini_text_bundles(self) -> None:
+        result = self.run_sync()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.gemini_output.is_dir())
+        index = (self.gemini_output / "00_REPOSITORY_INDEX.txt").read_text(encoding="utf-8")
+        self.assertIn("src/app.py", index)
+        self.assertIn("README.md", index)
+        bundle_files = sorted(self.gemini_output.glob("*.txt"))
+        self.assertGreaterEqual(len(bundle_files), 3)
+        combined = "\n".join(path.read_text(encoding="utf-8") for path in bundle_files)
+        self.assertIn("FILE: src/app.py", combined)
+        self.assertIn("print('v1')", combined)
+        self.assertIn("FILE: README.md", combined)
+        self.assertTrue(all(path.suffix == ".txt" for path in self.gemini_output.iterdir()))
+
+    def test_gemini_bundles_exclude_logs_and_binary_but_exact_mirror_keeps_them(self) -> None:
+        (self.work / "logs").mkdir()
+        (self.work / "logs" / "runtime.json").write_text('{"large": "runtime evidence"}\n', encoding="utf-8")
+        (self.work / "assets").mkdir()
+        (self.work / "assets" / "image.bin").write_bytes(b"abc\x00def")
+        (self.work / "src" / "helper.py").write_text("VALUE = 42\n", encoding="utf-8")
+        git(self.work, "add", ".")
+        git(self.work, "commit", "-m", "bundle filtering fixtures")
+        git(self.work, "push", "origin", "main")
+
+        result = self.run_sync()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.output / "logs" / "runtime.json").exists())
+        self.assertTrue((self.output / "assets" / "image.bin").exists())
+
+        index = (self.gemini_output / "00_REPOSITORY_INDEX.txt").read_text(encoding="utf-8")
+        self.assertIn("excluded directory: logs\tlogs/runtime.json", index)
+        self.assertIn("binary or non-text encoding\tassets/image.bin", index)
+        combined = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in self.gemini_output.glob("*.txt")
+            if path.name != "00_REPOSITORY_INDEX.txt"
+        )
+        self.assertIn("FILE: src/helper.py", combined)
+        self.assertIn("VALUE = 42", combined)
+        self.assertNotIn("runtime evidence", combined)
+        self.assertNotIn("abc\x00def", combined)
+
+    def test_missing_gemini_bundle_folder_is_rebuilt_without_new_commit(self) -> None:
+        first = self.run_sync()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        shutil.rmtree(self.gemini_output)
+        second = self.run_sync()
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertTrue((self.gemini_output / "00_REPOSITORY_INDEX.txt").exists())
+        self.assertNotIn("[up to date]", second.stdout)
+
+    def test_bundle_generation_splits_large_categories_and_preserves_file_paths(self) -> None:
+        self.assertEqual(self.run_sync().returncode, 0)
+        bundle_output = self.root / "small-bundles"
+        head = git(self.mirror, "rev-parse", "HEAD")
+        stats = sync.materialize_gemini_bundles(
+            self.mirror,
+            bundle_output,
+            head,
+            target_bytes=180,
+        )
+        self.assertGreater(stats["bundle_files"], 1)
+        index = (bundle_output / "00_REPOSITORY_INDEX.txt").read_text(encoding="utf-8")
+        self.assertIn("src/app.py", index)
+        self.assertIn("README.md", index)
+        self.assertTrue(all(path.suffix == ".txt" for path in bundle_output.iterdir()))
 
     def test_nested_unicode_and_spaces_are_exported(self) -> None:
         (self.work / "資料 folder").mkdir()
@@ -315,6 +385,8 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.output / "src" / "app.py").exists())
         self.assertTrue((second_output / "src" / "app.py").exists())
+        self.assertTrue((self.gemini_output / "00_REPOSITORY_INDEX.txt").exists())
+        self.assertTrue((second_output.with_name(second_output.name + "-Gemini") / "00_REPOSITORY_INDEX.txt").exists())
 
     def test_profile_id_is_stable(self) -> None:
         probe = subprocess.run(
