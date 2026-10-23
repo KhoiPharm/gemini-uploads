@@ -223,7 +223,7 @@ def ensure_mirror(source: str, branch: str, mirror: Path, *, reclone: bool = Fal
 
     if not mirror.exists():
         mirror.parent.mkdir(parents=True, exist_ok=True)
-        print(f"[sync] Cloning {source} ({branch}) ...")
+        print(f"[sync] Cloning {redact_remote_credentials(source)} ({branch}) ...")
         run_git(["clone", "--no-tags", "--single-branch", "--branch", branch, source, str(mirror)])
         return
 
@@ -256,6 +256,23 @@ def tracked_files(mirror: Path) -> list[str]:
     raw = run_git(["ls-files", "-z"], mirror, text=False)
     assert isinstance(raw, bytes)
     return [item.decode("utf-8", "strict") for item in raw.split(b"\0") if item]
+
+
+def cleanup_stale_backups(output: Path) -> None:
+    """Best-effort cleanup of prior successful output backups.
+
+    Cleanup is intentionally safe to retry. If a folder is still locked by
+    Google Drive, Explorer, antivirus, or indexing, leave it for a later run.
+    Never remove recovery backups while the primary output folder is missing.
+    """
+    if not output.exists():
+        return
+    parent = output.parent
+    for stale_backup in parent.glob(f".{output.name}.previous-*"):
+        try:
+            shutil.rmtree(stale_backup)
+        except OSError:
+            pass
 
 
 def materialize_tracked_files(mirror: Path, output: Path) -> tuple[int, list[str]]:
@@ -313,15 +330,7 @@ def materialize_tracked_files(mirror: Path, output: Path) -> tuple[int, list[str
                 shutil.rmtree(backup)
             except OSError as exc:
                 print(f"[WARNING] New output is ready; old folder cleanup will be retried later: {exc}")
-        for stale_backup in parent.glob(f".{output.name}.previous-*"):
-            if stale_backup == backup:
-                continue
-            try:
-                shutil.rmtree(stale_backup)
-            except OSError:
-                # Drive, Explorer, or antivirus may still be holding an old
-                # folder open. Keep it and try again after a later refresh.
-                pass
+        cleanup_stale_backups(output)
     finally:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
@@ -347,6 +356,9 @@ def profile_paths(profile_id: str, profile: dict[str, Any]) -> tuple[str, str, P
 def sync_profile(profile_id: str, profile: dict[str, Any], *, force: bool = False, reclone: bool = False) -> int:
     source, branch, output, mirror, state_path, lock_path = profile_paths(profile_id, profile)
     with sync_lock(lock_path):
+        # Retry local cleanup even when GitHub has not changed. This matters
+        # when Drive/Explorer temporarily locked an old backup on a prior run.
+        cleanup_stale_backups(output)
         ensure_mirror(source, branch, mirror, reclone=reclone)
         head = update_mirror(branch, mirror)
         state = load_json(state_path)
@@ -584,7 +596,10 @@ def main() -> int:
                 print("No repositories configured.")
                 return 0
             for pid, profile in sorted(profiles.items()):
-                print(f"{pid}\n  {profile.get('source_repo')} [{profile.get('branch', 'main')}]\n  -> {profile.get('output_dir')}")
+                print(
+                    f"{pid}\n  {redact_remote_credentials(str(profile.get('source_repo') or ''))} "
+                    f"[{profile.get('branch', 'main')}]\n  -> {profile.get('output_dir')}"
+                )
             return 0
 
         if args.install_task:
