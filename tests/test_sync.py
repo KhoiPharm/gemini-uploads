@@ -144,6 +144,16 @@ class SyncTests(unittest.TestCase):
         self.assertFalse((self.output / "known-good.txt").exists())
         self.assertFalse(backup.exists())
 
+    def test_unchanged_sync_retries_stale_backup_cleanup(self) -> None:
+        self.assertEqual(self.run_sync().returncode, 0)
+        stale = self.output.parent / f".{self.output.name}.previous-leftover"
+        stale.mkdir()
+        (stale / "old.txt").write_text("old", encoding="utf-8")
+        result = self.run_sync()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("[up to date]", result.stdout)
+        self.assertFalse(stale.exists())
+
     def test_stale_lock_is_recovered(self) -> None:
         lock = self.root / "locks" / "repo.lock"
         lock.parent.mkdir()
@@ -205,12 +215,24 @@ class SyncTests(unittest.TestCase):
         self.assertNotIn("test-secret-not-real", str(caught.exception))
         self.assertIn("[credentials]@github.com", str(caught.exception))
 
+    def test_clone_progress_redacts_embedded_url_credentials(self) -> None:
+        console = io.StringIO()
+        source = "https://user:test-secret-not-real@github.com/org/repo.git"
+        with mock.patch.object(sync, "run_git", side_effect=RuntimeError("stop")), redirect_stdout(console):
+            with self.assertRaises(RuntimeError):
+                sync.ensure_mirror(source, "main", self.root / "fresh mirror")
+        self.assertNotIn("test-secret-not-real", console.getvalue())
+        self.assertIn("[credentials]@github.com", console.getvalue())
+
     def test_unavailable_remote_preserves_previous_output_and_reports_failure(self) -> None:
         self.assertEqual(self.run_sync().returncode, 0)
         (self.output / "local marker.txt").write_text("preserve", encoding="utf-8")
-        git(self.mirror, "remote", "set-url", "origin", str(self.root / "missing remote.git"))
+        # Keep the configured/origin URL unchanged so this exercises a real
+        # fetch failure rather than only the mirror-URL mismatch guard.
+        self.remote.rename(self.root / "remote-offline.git")
         result = self.run_sync()
         self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Git command failed (fetch)", result.stderr)
         self.assertEqual((self.output / "src" / "app.py").read_text(encoding="utf-8"), "print('v1')\n")
         self.assertEqual((self.output / "local marker.txt").read_text(encoding="utf-8"), "preserve")
 
