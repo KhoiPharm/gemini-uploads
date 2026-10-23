@@ -123,6 +123,32 @@ class SyncTests(unittest.TestCase):
         self.assertNotIn("runtime evidence", combined)
         self.assertNotIn("abc\x00def", combined)
 
+    def test_explicit_empty_exclusion_list_can_include_logs(self) -> None:
+        (self.work / "logs").mkdir()
+        (self.work / "logs" / "useful.txt").write_text("include me\n", encoding="utf-8")
+        git(self.work, "add", ".")
+        git(self.work, "commit", "-m", "tracked useful log")
+        git(self.work, "push", "origin", "main")
+        profiles = json.loads(self.config.read_text(encoding="utf-8"))["profiles"]
+        profiles[self.profile]["gemini_excluded_dirs"] = []
+        self.write_profiles(profiles)
+        result = self.run_sync()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        combined = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in self.gemini_output.glob("*.txt")
+        )
+        self.assertIn("FILE: logs/useful.txt", combined)
+        self.assertIn("include me", combined)
+
+    def test_nested_gemini_output_is_rejected(self) -> None:
+        profiles = json.loads(self.config.read_text(encoding="utf-8"))["profiles"]
+        profiles[self.profile]["gemini_output_dir"] = str(self.output / "nested-gemini")
+        self.write_profiles(profiles)
+        result = self.run_sync()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot be inside the exact mirror", result.stderr)
+
     def test_missing_gemini_bundle_folder_is_rebuilt_without_new_commit(self) -> None:
         first = self.run_sync()
         self.assertEqual(first.returncode, 0, first.stderr)
