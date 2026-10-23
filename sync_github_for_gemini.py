@@ -90,7 +90,6 @@ def load_profiles(path: Path) -> dict[str, dict[str, Any]]:
     if isinstance(data.get("profiles"), dict):
         return dict(data["profiles"])
 
-    # Backward compatibility for the first single-repository version.
     if data.get("source_repo") and data.get("output_dir"):
         branch = str(data.get("branch") or "main")
         pid = profile_id_for(str(data["source_repo"]), branch)
@@ -103,7 +102,6 @@ def load_profiles(path: Path) -> dict[str, dict[str, Any]]:
             }
         }
 
-    # If the new file is absent, also recognize the old default config location.
     if not path.exists() and path == default_profiles_path():
         legacy = local_app_dir() / LEGACY_CONFIG_NAME
         legacy_data = load_json(legacy)
@@ -371,11 +369,29 @@ def task_name_for(profile_id: str) -> str:
     return f"{TASK_PREFIX}{profile_id}"[:230]
 
 
-def build_task_action(profile_id: str, profiles_path: Path, pythonw: Path, runtime_script: Path) -> str:
-    return (
+def vbs_quote(value: str) -> str:
+    return value.replace('"', '""')
+
+
+def write_hidden_launcher(profile_id: str, profiles_path: Path, pythonw: Path, runtime_script: Path) -> Path:
+    launcher = local_app_dir() / RUNTIME_DIR_NAME / f"launch-{profile_id}.vbs"
+    launcher.parent.mkdir(parents=True, exist_ok=True)
+    command = (
         f'"{pythonw}" "{runtime_script}" --profile "{profile_id}" '
         f'--config "{profiles_path}" --background'
     )
+    content = (
+        'Option Explicit\n'
+        'Dim shell\n'
+        'Set shell = CreateObject("WScript.Shell")\n'
+        f'shell.Run "{vbs_quote(command)}", 0, False\n'
+    )
+    launcher.write_text(content, encoding="utf-8")
+    return launcher
+
+
+def build_task_action(launcher: Path) -> str:
+    return f'wscript.exe //B //Nologo "{launcher}"'
 
 
 def register_background_task(profile_id: str, profiles_path: Path) -> None:
@@ -385,8 +401,9 @@ def register_background_task(profile_id: str, profiles_path: Path) -> None:
 
     runtime_script = install_runtime_copy()
     pythonw = find_pythonw()
+    launcher = write_hidden_launcher(profile_id, profiles_path, pythonw, runtime_script)
     task_name = task_name_for(profile_id)
-    action = build_task_action(profile_id, profiles_path, pythonw, runtime_script)
+    action = build_task_action(launcher)
     cmd = [
         "schtasks.exe",
         "/Create",
