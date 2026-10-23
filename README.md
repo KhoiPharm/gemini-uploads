@@ -67,6 +67,10 @@ Each configured repository gets:
 
 Adding another repository does not replace the first one.
 
+## Updating this utility
+
+After downloading a newer copy of `gemini-uploads`, double-click **`SetupGeminiRepo.bat`** once and enter the same repository URL, branch, and destination as one of your existing profiles. Setup refreshes the shared background script and updates that profile's scheduled task; all configured profiles use the refreshed script on their next run. Existing profiles and their destinations remain configured.
+
 ## Background behavior
 
 Each repository is checked every **2 minutes** while you are signed into Windows.
