@@ -37,8 +37,17 @@ MAX_UPLOAD_FILE_BYTES = 100 * 1024 * 1024
 MAX_LOG_BYTES = 2 * 1024 * 1024
 BACKGROUND_GIT_TIMEOUT_SECONDS = 90
 MAX_SCHTASKS_ACTION_CHARS = 262
-GEMINI_BUNDLE_VERSION = 1
-GEMINI_BUNDLE_TARGET_BYTES = 1024 * 1024
+GEMINI_BUNDLE_VERSION = 2
+GEMINI_BUNDLE_TARGET_BYTES = 256 * 1024
+GEMINI_START_VERSION = 1
+START_CONTEXT_MAX_BYTES = 192 * 1024
+START_CONTEXT_BASENAMES = {
+    "readme.md",
+    "agents.md",
+    "architecture.md",
+    "program_map.md",
+    "current_handover.md",
+}
 DEFAULT_GEMINI_EXCLUDED_TOP_LEVEL = {"logs"}
 BUNDLE_CATEGORY_PREFIXES = {
     "SOURCE": "01_SOURCE",
@@ -355,23 +364,27 @@ def gemini_bundle_output_dir(profile: dict[str, Any], exact_output: Path) -> Pat
     return exact_output.with_name(exact_output.name + "-Gemini")
 
 
-def validate_separate_outputs(exact_output: Path, gemini_output: Path) -> None:
-    exact_output = exact_output.resolve()
-    gemini_output = gemini_output.resolve()
-    if exact_output == gemini_output:
-        raise RuntimeError("Gemini bundle output must be different from the exact mirror output.")
-    try:
-        gemini_output.relative_to(exact_output)
-    except ValueError:
-        pass
-    else:
-        raise RuntimeError("Gemini bundle output cannot be inside the exact mirror output.")
-    try:
-        exact_output.relative_to(gemini_output)
-    except ValueError:
-        pass
-    else:
-        raise RuntimeError("Exact mirror output cannot be inside the Gemini bundle output.")
+def gemini_start_output_dir(profile: dict[str, Any], exact_output: Path) -> Path:
+    configured = str(profile.get("gemini_start_output_dir") or "").strip()
+    if configured:
+        return expand_path(configured)
+    return exact_output.with_name(exact_output.name + "-Gemini-Start")
+
+
+def validate_output_layout(*outputs: Path) -> None:
+    resolved = [path.resolve() for path in outputs]
+    for index, left in enumerate(resolved):
+        for right in resolved[index + 1:]:
+            if left == right:
+                raise RuntimeError("Generated output folders must be different from each other.")
+            for child, parent in ((left, right), (right, left)):
+                try:
+                    child.relative_to(parent)
+                except ValueError:
+                    continue
+                raise RuntimeError(
+                    f"Generated output folders cannot be nested: '{child}' is inside '{parent}'."
+                )
 
 
 def gemini_excluded_top_level(profile: dict[str, Any]) -> set[str]:
@@ -538,7 +551,9 @@ def materialize_gemini_bundles(
             f"Git commit: {head_sha}",
             f"Bundle format version: {GEMINI_BUNDLE_VERSION}",
             "",
-            "UPLOAD THIS ENTIRE FOLDER TO GEMINI USING IMPORT CODE > UPLOAD FOLDER.",
+            "DO NOT ZIP OR UPLOAD THIS ENTIRE FOLDER AT ONCE.",
+            "First upload the sibling '-Gemini-Start' folder.",
+            "Then upload only the specific bundle file(s) Gemini requests from this folder.",
             "The sibling folder without '-Gemini' is the exact Git-tracked mirror.",
             "These bundles contain source text only; no summaries or rewritten code are generated.",
             "",
@@ -575,6 +590,84 @@ def materialize_gemini_bundles(
     }
 
 
+def materialize_gemini_start(
+    mirror: Path,
+    bundle_output: Path,
+    start_output: Path,
+    head_sha: str,
+) -> dict[str, Any]:
+    """Create a tiny first-upload folder that tells Gemini which bundles to request."""
+    bundle_index = bundle_output / "00_REPOSITORY_INDEX.txt"
+    if not bundle_index.is_file():
+        raise RuntimeError(f"Gemini bundle index is missing: {bundle_index}")
+
+    start_output.parent.mkdir(parents=True, exist_ok=True)
+    staging = start_output.parent / f".{start_output.name}.staging-{uuid.uuid4().hex[:8]}"
+    staging.mkdir(parents=True, exist_ok=False)
+    context_sections: list[str] = []
+    context_paths: list[str] = []
+    context_bytes = 0
+
+    try:
+        guide = (
+            "GEMINI REPOSITORY STARTER\n"
+            f"Git commit: {head_sha}\n"
+            f"Starter format version: {GEMINI_START_VERSION}\n\n"
+            "PURPOSE\n"
+            "This folder is intentionally small. Read it first to understand the repository map.\n\n"
+            "IMPORTANT UPLOAD RULE\n"
+            "Do NOT ask the user to upload the whole repository ZIP or the whole '-Gemini' folder.\n"
+            "Those can exceed Gemini's extraction/context stream even when the files are valid.\n\n"
+            "WORKFLOW\n"
+            "1. Read 01_REPOSITORY_INDEX.txt and 02_CORE_CONTEXT.txt.\n"
+            "2. Identify the exact repository files needed for the current task.\n"
+            "3. Use the index to find which bundle contains each required file.\n"
+            "4. Ask the user to upload only those bundle file(s) from the sibling '-Gemini' folder.\n"
+            "5. Prefer the smallest set of bundles necessary for the task.\n\n"
+            "The bundle files preserve original repository paths and exact source text.\n"
+        )
+        (staging / "00_START_HERE.txt").write_text(guide, encoding="utf-8", newline="\n")
+        shutil.copy2(bundle_index, staging / "01_REPOSITORY_INDEX.txt")
+
+        for rel in sorted(tracked_files(mirror), key=str.lower):
+            if Path(rel).name.lower() not in START_CONTEXT_BASENAMES:
+                continue
+            src = mirror / Path(rel)
+            try:
+                text = decode_bundle_text(src)
+            except OSError:
+                continue
+            if text is None:
+                continue
+            section = _bundle_section(rel, text)
+            size = len(section.encode("utf-8"))
+            if size > START_CONTEXT_MAX_BYTES or context_bytes + size > START_CONTEXT_MAX_BYTES:
+                continue
+            context_sections.append(section)
+            context_paths.append(rel)
+            context_bytes += size
+
+        core_header = (
+            "GEMINI STARTER CORE CONTEXT\n"
+            f"Git commit: {head_sha}\n"
+            "This file contains selected repository orientation documents only.\n"
+            "Use 01_REPOSITORY_INDEX.txt to request implementation bundles for actual code review.\n"
+        )
+        (staging / "02_CORE_CONTEXT.txt").write_text(
+            core_header + "".join(context_sections), encoding="utf-8", newline="\n"
+        )
+        _promote_generated_directory(staging, start_output)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+
+    return {
+        "output_dir": str(start_output),
+        "context_files": len(context_paths),
+        "context_bytes": context_bytes,
+    }
+
+
 def profile_paths(profile_id: str, profile: dict[str, Any]) -> tuple[str, str, Path, Path, Path, Path]:
     source = str(profile.get("source_repo") or "").strip()
     branch = str(profile.get("branch") or "main").strip()
@@ -593,14 +686,17 @@ def profile_paths(profile_id: str, profile: dict[str, Any]) -> tuple[str, str, P
 def sync_profile(profile_id: str, profile: dict[str, Any], *, force: bool = False, reclone: bool = False) -> int:
     source, branch, output, mirror, state_path, lock_path = profile_paths(profile_id, profile)
     gemini_output = gemini_bundle_output_dir(profile, output)
-    validate_separate_outputs(output, gemini_output)
+    gemini_start = gemini_start_output_dir(profile, output)
+    validate_output_layout(output, gemini_output, gemini_start)
     validate_output_dir(gemini_output, mirror)
+    validate_output_dir(gemini_start, mirror)
 
     with sync_lock(lock_path):
         # Retry local cleanup even when GitHub has not changed. This matters
         # when Drive/Explorer temporarily locked an old backup on a prior run.
         cleanup_stale_backups(output)
         cleanup_stale_backups(gemini_output)
+        cleanup_stale_backups(gemini_start)
         ensure_mirror(source, branch, mirror, reclone=reclone)
         head = update_mirror(branch, mirror)
         state = load_json(state_path)
@@ -612,9 +708,16 @@ def sync_profile(profile_id: str, profile: dict[str, Any], *, force: bool = Fals
             and same_head
             and state.get("bundle_version") == GEMINI_BUNDLE_VERSION
         )
-        if not force and exact_current and bundle_current:
+        start_current = (
+            gemini_start.exists()
+            and same_head
+            and state.get("start_version") == GEMINI_START_VERSION
+            and bundle_current
+        )
+        if not force and exact_current and bundle_current and start_current:
             print(f"[up to date] {profile_id}: {branch} @ {head[:12]}")
-            print(f"[Gemini folder] {gemini_output}")
+            print(f"[Gemini starter] {gemini_start}")
+            print(f"[Gemini bundles] {gemini_output}")
             return 0
 
         if force or not exact_current:
@@ -638,6 +741,15 @@ def sync_profile(profile_id: str, profile: dict[str, Any], *, force: bool = Fals
                 "output_dir": str(gemini_output),
             }
 
+        if force or not start_current:
+            start_stats = materialize_gemini_start(mirror, gemini_output, gemini_start, head)
+        else:
+            start_stats = {
+                "output_dir": str(gemini_start),
+                "context_files": state.get("gemini_start_context_files", 0),
+                "context_bytes": state.get("gemini_start_context_bytes", 0),
+            }
+
         write_json_atomic(
             state_path,
             {
@@ -647,10 +759,14 @@ def sync_profile(profile_id: str, profile: dict[str, Any], *, force: bool = Fals
                 "head_sha": head,
                 "output_dir": str(output),
                 "gemini_output_dir": str(gemini_output),
+                "gemini_start_output_dir": str(gemini_start),
                 "bundle_version": GEMINI_BUNDLE_VERSION,
+                "start_version": GEMINI_START_VERSION,
                 "gemini_included_files": bundle_stats["included_files"],
                 "gemini_skipped_files": bundle_stats["skipped_files"],
                 "gemini_bundle_files": bundle_stats["bundle_files"],
+                "gemini_start_context_files": start_stats["context_files"],
+                "gemini_start_context_bytes": start_stats["context_bytes"],
                 "synced_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             },
         )
@@ -664,7 +780,8 @@ def sync_profile(profile_id: str, profile: dict[str, Any], *, force: bool = Fals
             f"[Gemini] {bundle_stats['included_files']} text files -> "
             f"{bundle_stats['bundle_files']} bundles; {bundle_stats['skipped_files']} skipped"
         )
-        print(f"[Gemini folder] {gemini_output}")
+        print(f"[Gemini starter] {gemini_start}")
+        print(f"[Gemini bundles] {gemini_output}")
         if oversized:
             print("[WARNING] Files over 100 MB may exceed Gemini's per-file upload limit:")
             for path in oversized:
