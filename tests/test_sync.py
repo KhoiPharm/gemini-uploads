@@ -33,6 +33,7 @@ class SyncTests(unittest.TestCase):
         self.mirror = self.root / "mirror clone"
         self.output = self.root / "Gemini upload output"
         self.gemini_output = self.root / "Gemini upload output-Gemini"
+        self.gemini_start = self.root / "Gemini upload output-Gemini-Start"
         self.config = self.root / "profiles config.json"
 
         subprocess.run(["git", "init", "--bare", str(self.remote)], check=True, capture_output=True)
@@ -95,6 +96,32 @@ class SyncTests(unittest.TestCase):
         self.assertIn("FILE: README.md", combined)
         self.assertTrue(all(path.suffix == ".txt" for path in self.gemini_output.iterdir()))
 
+    def test_first_sync_creates_small_starter_folder(self) -> None:
+        result = self.run_sync()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.gemini_start.is_dir())
+        names = sorted(path.name for path in self.gemini_start.iterdir())
+        self.assertEqual(names, [
+            "00_START_HERE.txt",
+            "01_REPOSITORY_INDEX.txt",
+            "02_CORE_CONTEXT.txt",
+        ])
+        guide = (self.gemini_start / "00_START_HERE.txt").read_text(encoding="utf-8")
+        self.assertIn("Do NOT ask the user to upload the whole repository ZIP", guide)
+        self.assertIn("upload only those bundle file(s)", guide)
+        index = (self.gemini_start / "01_REPOSITORY_INDEX.txt").read_text(encoding="utf-8")
+        self.assertIn("src/app.py", index)
+        core = (self.gemini_start / "02_CORE_CONTEXT.txt").read_text(encoding="utf-8")
+        self.assertIn("FILE: README.md", core)
+        self.assertNotIn("FILE: src/app.py", core)
+
+    def test_bundle_index_warns_against_full_folder_upload(self) -> None:
+        result = self.run_sync()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        index = (self.gemini_output / "00_REPOSITORY_INDEX.txt").read_text(encoding="utf-8")
+        self.assertIn("DO NOT ZIP OR UPLOAD THIS ENTIRE FOLDER AT ONCE", index)
+        self.assertIn("-Gemini-Start", index)
+
     def test_gemini_bundles_exclude_logs_and_binary_but_exact_mirror_keeps_them(self) -> None:
         (self.work / "logs").mkdir()
         (self.work / "logs" / "runtime.json").write_text('{"large": "runtime evidence"}\n', encoding="utf-8")
@@ -147,7 +174,7 @@ class SyncTests(unittest.TestCase):
         self.write_profiles(profiles)
         result = self.run_sync()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("cannot be inside the exact mirror", result.stderr)
+        self.assertIn("cannot be nested", result.stderr)
 
     def test_missing_gemini_bundle_folder_is_rebuilt_without_new_commit(self) -> None:
         first = self.run_sync()
@@ -156,6 +183,15 @@ class SyncTests(unittest.TestCase):
         second = self.run_sync()
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertTrue((self.gemini_output / "00_REPOSITORY_INDEX.txt").exists())
+        self.assertNotIn("[up to date]", second.stdout)
+
+    def test_missing_starter_folder_is_rebuilt_without_new_commit(self) -> None:
+        first = self.run_sync()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        shutil.rmtree(self.gemini_start)
+        second = self.run_sync()
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertTrue((self.gemini_start / "00_START_HERE.txt").exists())
         self.assertNotIn("[up to date]", second.stdout)
 
     def test_bundle_generation_splits_large_categories_and_preserves_file_paths(self) -> None:
@@ -412,7 +448,9 @@ class SyncTests(unittest.TestCase):
         self.assertTrue((self.output / "src" / "app.py").exists())
         self.assertTrue((second_output / "src" / "app.py").exists())
         self.assertTrue((self.gemini_output / "00_REPOSITORY_INDEX.txt").exists())
+        self.assertTrue((self.gemini_start / "00_START_HERE.txt").exists())
         self.assertTrue((second_output.with_name(second_output.name + "-Gemini") / "00_REPOSITORY_INDEX.txt").exists())
+        self.assertTrue((second_output.with_name(second_output.name + "-Gemini-Start") / "00_START_HERE.txt").exists())
 
     def test_profile_id_is_stable(self) -> None:
         probe = subprocess.run(
