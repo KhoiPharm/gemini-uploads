@@ -162,9 +162,15 @@ Adding another repository does not replace the first one.
 
 ## Updating this utility
 
-After downloading a newer copy of `gemini-uploads`, double-click **`SetupGeminiRepo.bat`** once and enter the same repository URL, branch, and destination as an existing profile.
+After downloading/pulling a newer copy of `gemini-uploads`, double-click:
 
-Setup refreshes the installed background runtime and scheduled task. Existing profiles and destinations remain configured.
+```text
+UpdateGeminiRepo.bat
+```
+
+The manual updater now refreshes the installed silent background runtime first, then force-refreshes every configured repository and its Gemini bundles. You do not need to re-enter repository details for ordinary upgrades.
+
+If a future release changes the Windows Scheduled Task definition itself, run `SetupGeminiRepo.bat` again for that profile.
 
 Older profiles that do not contain an explicit Gemini bundle path automatically use:
 
