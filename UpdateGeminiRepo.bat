@@ -1,7 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-call :runpy sync_github_for_gemini.py %*
+call :runpy sync_github_for_gemini.py --all --force
 set "RC=%errorlevel%"
 echo.
 pause

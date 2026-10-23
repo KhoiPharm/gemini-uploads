@@ -1,73 +1,114 @@
 # Gemini GitHub Upload Sync
 
-A small Windows utility that keeps a clean local folder synchronized to one GitHub branch so the folder can be uploaded to Gemini web.
+A Windows utility that silently keeps one or more local Gemini-upload folders synchronized with GitHub repositories.
 
-## What it does
+## Normal behavior
 
 ```text
 GitHub repository/branch
-        ↓ fetch
+        ↓
+Windows Scheduled Task (silent, every 2 minutes)
+        ↓
 Disposable local Git mirror
-        ↓ copy Git-tracked files only
+        ↓
+Git-tracked files only
+        ↓
 Gemini upload folder
 ```
 
-The upload folder contains the repository files from the selected GitHub commit, but **does not contain `.git`**, untracked files, caches, local databases, or other files that are not committed to GitHub.
+After one-time setup, there is **no terminal window during normal syncing**.
 
-The utility never changes the source GitHub repository and never touches your normal development checkout. Its own mirror clone is disposable and may safely be reset/cleaned.
+The scheduled task is stored by Windows, so it survives shutdown and restart. When the laptop is turned back on and you sign in, syncing resumes automatically. If the internet, GitHub authentication, or a Google Drive output folder is temporarily unavailable, a later scheduled run retries automatically.
+
+## What is copied
+
+The upload folder contains files tracked by Git at the selected GitHub branch/commit.
+
+It does **not** copy:
+
+- `.git`
+- untracked files
+- local databases or runtime files that are not committed
+- caches created only inside the disposable mirror
+
+The utility never changes your normal development checkout. Its own Git mirror is disposable and may safely be reset or cleaned.
 
 ## Requirements
 
 - Windows 11
 - Python 3.11+
 - Git for Windows
-- Git credentials already configured for the source repository (Git Credential Manager, SSH, etc.)
+- Git access already available for the source repository (Git Credential Manager, SSH, etc.)
 
-No Python packages are required.
+No third-party Python packages are required.
 
-## First-time setup
+## First repository
 
 1. Clone or download this `gemini-uploads` repository.
 2. Double-click **`SetupGeminiRepo.bat`**.
-3. Paste the source repository clone URL, for example `https://github.com/OWNER/REPOSITORY.git`.
+3. Paste the source repository clone URL.
 4. Enter the branch Gemini should see.
-5. Enter a local output folder, for example `C:\GeminiUploads\PharmacyRepo`.
+5. Enter the local/Google Drive folder Gemini will upload from.
 
-The configuration is stored under your Windows local application-data folder, not committed to this repository.
+Setup performs the first synchronization immediately and registers a Windows Scheduled Task for that repository.
 
-After setup, the first synchronization runs automatically.
+After setup completes, close the window. You do not need to leave anything open.
 
-## Normal use
+## Adding another repository
 
-Double-click **`UpdateGeminiRepo.bat`** whenever you want to refresh the upload folder from GitHub.
+Double-click **`SetupGeminiRepo.bat`** again and enter the second repository, branch, and a different output folder.
 
-For continuous checking while you work, double-click **`WatchGeminiRepo.bat`**. It checks GitHub every two minutes and only rebuilds the upload folder when the branch commit changes. Press `Ctrl+C` to stop it.
+Each configured repository gets:
 
-## Important behavior
+- its own local profile
+- its own disposable Git mirror
+- its own output folder
+- its own silent Windows Scheduled Task
 
-- GitHub is authoritative. Local edits made directly inside the Gemini upload folder are not preserved after the next GitHub update.
-- Only files tracked by Git are copied.
-- The `.git` directory is never copied.
-- Deleting a file from GitHub removes it from the upload folder on the next changed commit.
-- A replacement upload folder is built before the old one is swapped out, reducing the chance of leaving a half-updated folder.
-- Files over 100 MB are reported as warnings because they may exceed Gemini's upload limit.
+Adding another repository does not replace the first one.
 
-## Recovery
+## Background behavior
 
-If the disposable mirror becomes damaged, run:
+Each repository is checked every **2 minutes** while you are signed into Windows.
 
-```bat
-python sync_github_for_gemini.py --reclone --force
+The Scheduled Task runs `pythonw.exe`, and background Git commands are created without a console window. Normal background checks therefore do not flash Command Prompt or PowerShell windows.
+
+The task persists across reboot. A laptop cannot synchronize while powered off, but after Windows starts and you sign in, the scheduled checks continue automatically.
+
+This user-session design is intentional: private GitHub credentials and Google Drive for Desktop normally belong to your signed-in Windows account.
+
+## Manual refresh
+
+You normally do not need this. If you deliberately want to force an immediate refresh of every configured repository, double-click:
+
+`UpdateGeminiRepo.bat`
+
+That manual utility shows a terminal because you explicitly launched it and may want to see errors/results.
+
+## Local configuration and logs
+
+Repository URLs, branches, output paths, state, logs, mirrors, and the installed runtime copy live under your Windows local application-data directory, typically:
+
+```text
+%LOCALAPPDATA%\GeminiRepoSync\
 ```
 
-This deletes/recreates only the utility's disposable mirror. It does not touch your normal repository checkout.
+They are not committed to this public utility repository.
 
-To rebuild the upload folder even if GitHub is still on the same commit:
+Background logs are kept under:
 
-```bat
-python sync_github_for_gemini.py --force
+```text
+%LOCALAPPDATA%\GeminiRepoSync\logs\
 ```
 
-## Why this is intentionally simpler
+Logs rotate automatically when they become large.
 
-This utility does not generate handoff summaries, architecture summaries, patches, or curated source bundles. If the GitHub repository already contains the documentation and handoff material an agent needs, duplicating that information creates unnecessary complexity and another possible source of stale context.
+## Privacy and source of truth
+
+GitHub remains authoritative. The output folder is a generated copy for Gemini web.
+
+Local edits made directly inside a Gemini output folder are not preserved. The next changed GitHub commit replaces that folder with a fresh Git-tracked snapshot.
+
+## Large files
+
+Files over 100 MB are reported in the background log because they may exceed Gemini's per-file upload limit.
