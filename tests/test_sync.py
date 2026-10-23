@@ -24,7 +24,7 @@ class SyncTests(unittest.TestCase):
         self.remote = self.root / "remote.git"
         self.mirror = self.root / "mirror"
         self.output = self.root / "output"
-        self.config = self.root / "config.json"
+        self.config = self.root / "profiles.json"
 
         subprocess.run(["git", "init", "--bare", str(self.remote)], check=True, capture_output=True)
         subprocess.run(["git", "init", "-b", "main", str(self.work)], check=True, capture_output=True)
@@ -38,24 +38,27 @@ class SyncTests(unittest.TestCase):
         git(self.work, "remote", "add", "origin", str(self.remote))
         git(self.work, "push", "-u", "origin", "main")
 
-        self.config.write_text(
-            json.dumps(
-                {
+        self.profile = "test-repo"
+        self.write_profiles(
+            {
+                self.profile: {
                     "source_repo": str(self.remote),
                     "branch": "main",
                     "output_dir": str(self.output),
                     "mirror_dir": str(self.mirror),
                 }
-            ),
-            encoding="utf-8",
+            }
         )
+
+    def write_profiles(self, profiles: dict) -> None:
+        self.config.write_text(json.dumps({"version": 2, "profiles": profiles}), encoding="utf-8")
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
     def run_sync(self, *extra: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(SCRIPT), "--config", str(self.config), *extra],
+            [sys.executable, str(SCRIPT), "--config", str(self.config), "--profile", self.profile, *extra],
             text=True,
             capture_output=True,
             check=False,
@@ -96,6 +99,41 @@ class SyncTests(unittest.TestCase):
         result = self.run_sync()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("[up to date]", result.stdout)
+
+    def test_multiple_profiles_are_independent(self) -> None:
+        second_mirror = self.root / "mirror2"
+        second_output = self.root / "output2"
+        profiles = json.loads(self.config.read_text(encoding="utf-8"))["profiles"]
+        profiles["second"] = {
+            "source_repo": str(self.remote),
+            "branch": "main",
+            "output_dir": str(second_output),
+            "mirror_dir": str(second_mirror),
+        }
+        self.write_profiles(profiles)
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--config", str(self.config), "--all"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.output / "src" / "app.py").exists())
+        self.assertTrue((second_output / "src" / "app.py").exists())
+
+    def test_profile_id_is_stable(self) -> None:
+        probe = subprocess.run(
+            [sys.executable, "-c", (
+                "import importlib.util; "
+                f"s=importlib.util.spec_from_file_location('m', r'{SCRIPT}'); "
+                "m=importlib.util.module_from_spec(s); s.loader.exec_module(m); "
+                "print(m.profile_id_for('https://github.com/A/B.git','main'))"
+            )],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        self.assertEqual(probe.stdout.strip(), "B-dec055c3")
 
 
 if __name__ == "__main__":
