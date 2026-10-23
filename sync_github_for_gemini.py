@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Keep a clean Gemini-upload folder synchronized to one GitHub branch.
+"""Silently mirror one or more GitHub branches into clean Gemini upload folders.
 
-The program uses a dedicated disposable Git clone, never the user's normal
-working checkout. Only Git-tracked files from the selected commit are copied
-into the upload folder; .git metadata and local/generated files are excluded.
+Each configured repository gets its own disposable local Git mirror, output folder,
+and Windows Scheduled Task. Background runs are windowless and repeat every two
+minutes while the configured Windows user is signed in.
 
 Standard library only. Requires Git on PATH.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -22,11 +23,19 @@ from pathlib import Path
 from typing import Any, Iterable
 
 APP_DIR_NAME = "GeminiRepoSync"
-CONFIG_NAME = "config.json"
-STATE_NAME = "state.json"
-LOCK_NAME = "sync.lock"
-DEFAULT_POLL_SECONDS = 120
+PROFILES_NAME = "profiles.json"
+LEGACY_CONFIG_NAME = "config.json"
+STATE_DIR_NAME = "state"
+LOCK_DIR_NAME = "locks"
+LOG_DIR_NAME = "logs"
+MIRROR_DIR_NAME = "mirrors"
+RUNTIME_DIR_NAME = "runtime"
+TASK_PREFIX = "GeminiRepoSync-"
+SYNC_INTERVAL_MINUTES = 2
 MAX_UPLOAD_FILE_BYTES = 100 * 1024 * 1024
+MAX_LOG_BYTES = 2 * 1024 * 1024
+
+BACKGROUND_MODE = False
 
 
 def local_app_dir() -> Path:
@@ -37,8 +46,8 @@ def local_app_dir() -> Path:
     return Path.home() / ".gemini_repo_sync"
 
 
-def default_config_path() -> Path:
-    return local_app_dir() / CONFIG_NAME
+def default_profiles_path() -> Path:
+    return local_app_dir() / PROFILES_NAME
 
 
 def expand_path(value: str) -> Path:
@@ -46,34 +55,18 @@ def expand_path(value: str) -> Path:
     return Path(expanded).resolve()
 
 
-def run_git(args: list[str], cwd: Path | None = None, *, text: bool = True) -> str | bytes:
-    cmd = ["git", *args]
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(cwd) if cwd else None,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=text,
-            encoding="utf-8" if text else None,
-            errors="replace" if text else None,
-            check=False,
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError("Git was not found. Install Git for Windows and try again.") from exc
-    if proc.returncode != 0:
-        stderr = proc.stderr.strip() if text else proc.stderr.decode("utf-8", "replace").strip()
-        raise RuntimeError(f"Git command failed: {' '.join(cmd)}\n{stderr}")
-    return proc.stdout.strip() if text else proc.stdout
-
-
-def repo_slug(source: str) -> str:
-    cleaned = source.rstrip("/\\")
+def safe_slug(value: str) -> str:
+    cleaned = value.strip().rstrip("/\\")
     name = cleaned.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
     if name.endswith(".git"):
         name = name[:-4]
-    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+    safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in name).strip("-")
     return safe or "repository"
+
+
+def profile_id_for(source: str, branch: str) -> str:
+    digest = hashlib.sha1(f"{source.strip()}\n{branch.strip()}".encode("utf-8")).hexdigest()[:8]
+    return f"{safe_slug(source)[:40]}-{digest}"
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -90,6 +83,46 @@ def write_json_atomic(path: Path, data: dict[str, Any]) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, path)
+
+
+def load_profiles(path: Path) -> dict[str, dict[str, Any]]:
+    data = load_json(path)
+    if isinstance(data.get("profiles"), dict):
+        return dict(data["profiles"])
+
+    # Backward compatibility for the first single-repository version.
+    if data.get("source_repo") and data.get("output_dir"):
+        branch = str(data.get("branch") or "main")
+        pid = profile_id_for(str(data["source_repo"]), branch)
+        return {
+            pid: {
+                "source_repo": str(data["source_repo"]),
+                "branch": branch,
+                "output_dir": str(data["output_dir"]),
+                "mirror_dir": str(data.get("mirror_dir") or ""),
+            }
+        }
+
+    # If the new file is absent, also recognize the old default config location.
+    if not path.exists() and path == default_profiles_path():
+        legacy = local_app_dir() / LEGACY_CONFIG_NAME
+        legacy_data = load_json(legacy)
+        if legacy_data.get("source_repo") and legacy_data.get("output_dir"):
+            branch = str(legacy_data.get("branch") or "main")
+            pid = profile_id_for(str(legacy_data["source_repo"]), branch)
+            return {
+                pid: {
+                    "source_repo": str(legacy_data["source_repo"]),
+                    "branch": branch,
+                    "output_dir": str(legacy_data["output_dir"]),
+                    "mirror_dir": str(legacy_data.get("mirror_dir") or ""),
+                }
+            }
+    return {}
+
+
+def save_profiles(path: Path, profiles: dict[str, dict[str, Any]]) -> None:
+    write_json_atomic(path, {"version": 2, "profiles": profiles})
 
 
 def normalized_remote(value: str) -> str:
@@ -117,6 +150,38 @@ def validate_output_dir(output: Path, mirror: Path) -> None:
         raise RuntimeError("Gemini output folder cannot be inside the Git mirror directory.")
 
 
+def _creation_flags() -> int:
+    if BACKGROUND_MODE and sys.platform == "win32":
+        return int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return 0
+
+
+def run_git(args: list[str], cwd: Path | None = None, *, text: bool = True) -> str | bytes:
+    cmd = ["git", *args]
+    env = os.environ.copy()
+    if BACKGROUND_MODE:
+        env["GIT_TERMINAL_PROMPT"] = "0"
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=text,
+            encoding="utf-8" if text else None,
+            errors="replace" if text else None,
+            check=False,
+            env=env,
+            creationflags=_creation_flags(),
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("Git was not found. Install Git for Windows and try again.") from exc
+    if proc.returncode != 0:
+        stderr = proc.stderr.strip() if text else proc.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(f"Git command failed: {' '.join(cmd)}\n{stderr}")
+    return proc.stdout.strip() if text else proc.stdout
+
+
 @contextmanager
 def sync_lock(lock_path: Path) -> Iterable[None]:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -128,7 +193,7 @@ def sync_lock(lock_path: Path) -> Iterable[None]:
             lock_path.unlink(missing_ok=True)
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         else:
-            raise RuntimeError("Another Gemini repository sync is already running.")
+            raise RuntimeError("This repository is already being synchronized by another process.")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(str(os.getpid()))
@@ -156,9 +221,9 @@ def ensure_mirror(source: str, branch: str, mirror: Path, *, reclone: bool = Fal
     current_remote = str(run_git(["remote", "get-url", "origin"], mirror))
     if normalized_remote(current_remote) != normalized_remote(source):
         raise RuntimeError(
-            "The existing mirror points to a different repository.\n"
+            "The disposable mirror points to a different repository.\n"
             f"Configured: {source}\nMirror origin: {current_remote}\n"
-            "Run with --reclone to rebuild the disposable mirror safely."
+            "Run with --reclone to rebuild only the disposable mirror."
         )
 
 
@@ -174,12 +239,7 @@ def update_mirror(branch: str, mirror: Path) -> str:
 def tracked_files(mirror: Path) -> list[str]:
     raw = run_git(["ls-files", "-z"], mirror, text=False)
     assert isinstance(raw, bytes)
-    files: list[str] = []
-    for item in raw.split(b"\0"):
-        if not item:
-            continue
-        files.append(item.decode("utf-8", "strict"))
-    return files
+    return [item.decode("utf-8", "strict") for item in raw.split(b"\0") if item]
 
 
 def materialize_tracked_files(mirror: Path, output: Path) -> tuple[int, list[str]]:
@@ -229,70 +289,37 @@ def materialize_tracked_files(mirror: Path, output: Path) -> tuple[int, list[str
     return len(files), oversized
 
 
-def resolve_settings(args: argparse.Namespace) -> tuple[str, str, Path, Path, Path]:
-    config_path = expand_path(args.config) if args.config else default_config_path()
-    cfg = load_json(config_path)
-
-    source = args.source or cfg.get("source_repo")
-    branch = args.branch or cfg.get("branch") or "main"
-    output_raw = args.output or cfg.get("output_dir")
-    mirror_raw = args.mirror or cfg.get("mirror_dir")
-
+def profile_paths(profile_id: str, profile: dict[str, Any]) -> tuple[str, str, Path, Path, Path, Path]:
+    source = str(profile.get("source_repo") or "").strip()
+    branch = str(profile.get("branch") or "main").strip()
+    output_raw = str(profile.get("output_dir") or "").strip()
+    mirror_raw = str(profile.get("mirror_dir") or "").strip()
     if not source or not output_raw:
-        raise RuntimeError(
-            "Sync is not configured yet. Run SetupGeminiRepo.bat once, or run:\n"
-            "  python sync_github_for_gemini.py --setup"
-        )
-
-    output = expand_path(str(output_raw))
-    mirror = expand_path(str(mirror_raw)) if mirror_raw else local_app_dir() / "mirrors" / repo_slug(str(source))
+        raise RuntimeError(f"Profile '{profile_id}' is incomplete.")
+    output = expand_path(output_raw)
+    mirror = expand_path(mirror_raw) if mirror_raw else local_app_dir() / MIRROR_DIR_NAME / profile_id
     validate_output_dir(output, mirror)
-    return str(source), str(branch), output, mirror, config_path
+    state_path = local_app_dir() / STATE_DIR_NAME / f"{profile_id}.json"
+    lock_path = local_app_dir() / LOCK_DIR_NAME / f"{profile_id}.lock"
+    return source, branch, output, mirror, state_path, lock_path
 
 
-def interactive_setup(config_path: Path) -> None:
-    print("\nGemini GitHub Sync - one-time setup")
-    print("This stores configuration only on this computer, not in GitHub.\n")
-    source = input("GitHub repository clone URL (HTTPS or SSH): ").strip()
-    if not source:
-        raise RuntimeError("Repository URL cannot be empty.")
-    branch = input("Branch to mirror [main]: ").strip() or "main"
-    output = input(r"Gemini upload folder (example C:\GeminiUploads\PharmacyRepo): ").strip()
-    if not output:
-        raise RuntimeError("Output folder cannot be empty.")
-    mirror = str(local_app_dir() / "mirrors" / repo_slug(source))
-    write_json_atomic(
-        config_path,
-        {
-            "source_repo": source,
-            "branch": branch,
-            "output_dir": output,
-            "mirror_dir": mirror,
-        },
-    )
-    print(f"\n[SUCCESS] Configuration saved locally: {config_path}")
-    print("Run UpdateGeminiRepo.bat to create/update the Gemini upload folder.")
-
-
-def sync_once(args: argparse.Namespace) -> int:
-    source, branch, output, mirror, config_path = resolve_settings(args)
-    state_path = config_path.with_name(STATE_NAME)
-    lock_path = config_path.with_name(LOCK_NAME)
-
+def sync_profile(profile_id: str, profile: dict[str, Any], *, force: bool = False, reclone: bool = False) -> int:
+    source, branch, output, mirror, state_path, lock_path = profile_paths(profile_id, profile)
     with sync_lock(lock_path):
-        ensure_mirror(source, branch, mirror, reclone=args.reclone)
+        ensure_mirror(source, branch, mirror, reclone=reclone)
         head = update_mirror(branch, mirror)
         state = load_json(state_path)
 
-        if not args.force and output.exists() and state.get("head_sha") == head:
-            print(f"[up to date] {branch} @ {head[:12]}")
-            print(f"[folder] {output}")
+        if not force and output.exists() and state.get("head_sha") == head:
+            print(f"[up to date] {profile_id}: {branch} @ {head[:12]}")
             return 0
 
         count, oversized = materialize_tracked_files(mirror, output)
         write_json_atomic(
             state_path,
             {
+                "profile_id": profile_id,
                 "source_repo": source,
                 "branch": branch,
                 "head_sha": head,
@@ -301,69 +328,233 @@ def sync_once(args: argparse.Namespace) -> int:
             },
         )
 
-        print("[SUCCESS] Gemini upload folder refreshed from GitHub.")
+        print(f"[SUCCESS] {profile_id} refreshed from GitHub.")
         print(f"[branch] {branch}")
         print(f"[commit] {head}")
         print(f"[files]  {count} Git-tracked files")
         print(f"[folder] {output}")
         if oversized:
-            print("[WARNING] These files are over 100 MB and may exceed Gemini's per-file upload limit:")
+            print("[WARNING] Files over 100 MB may exceed Gemini's per-file upload limit:")
             for path in oversized:
                 print(f"  - {path}")
         return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Mirror one GitHub branch into a clean Gemini upload folder.")
-    p.add_argument("--setup", action="store_true", help="Run interactive one-time setup.")
-    p.add_argument("--config", help="Override local config JSON path.")
-    p.add_argument("--source", help="Override source Git repository URL/path.")
-    p.add_argument("--branch", help="Override branch name.")
-    p.add_argument("--output", help="Override Gemini upload folder.")
-    p.add_argument("--mirror", help="Override disposable local Git clone path.")
-    p.add_argument("--force", action="store_true", help="Rebuild output even if commit SHA is unchanged.")
-    p.add_argument("--reclone", action="store_true", help="Delete/recreate only the disposable mirror clone.")
-    p.add_argument(
-        "--watch",
-        nargs="?",
-        const=DEFAULT_POLL_SECONDS,
-        type=int,
-        metavar="SECONDS",
-        help=f"Keep polling GitHub (default {DEFAULT_POLL_SECONDS}s).",
+def find_pythonw() -> Path:
+    exe = Path(sys.executable).resolve()
+    sibling = exe.with_name("pythonw.exe")
+    if sibling.exists():
+        return sibling
+    found = shutil.which("pythonw.exe") or shutil.which("pythonw")
+    if found:
+        return Path(found).resolve()
+    raise RuntimeError(
+        "Could not find pythonw.exe, which is needed for silent background sync. "
+        "Reinstall Python for Windows with the standard launcher/runtime enabled."
     )
+
+
+def installed_runtime_script() -> Path:
+    return local_app_dir() / RUNTIME_DIR_NAME / "sync_github_for_gemini.py"
+
+
+def install_runtime_copy() -> Path:
+    target = installed_runtime_script()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    source = Path(__file__).resolve()
+    if source != target:
+        shutil.copy2(source, target)
+    return target
+
+
+def task_name_for(profile_id: str) -> str:
+    return f"{TASK_PREFIX}{profile_id}"[:230]
+
+
+def build_task_action(profile_id: str, profiles_path: Path, pythonw: Path, runtime_script: Path) -> str:
+    return (
+        f'"{pythonw}" "{runtime_script}" --profile "{profile_id}" '
+        f'--config "{profiles_path}" --background'
+    )
+
+
+def register_background_task(profile_id: str, profiles_path: Path) -> None:
+    if sys.platform != "win32":
+        print("[INFO] Windows Task Scheduler registration skipped on non-Windows system.")
+        return
+
+    runtime_script = install_runtime_copy()
+    pythonw = find_pythonw()
+    task_name = task_name_for(profile_id)
+    action = build_task_action(profile_id, profiles_path, pythonw, runtime_script)
+    cmd = [
+        "schtasks.exe",
+        "/Create",
+        "/TN",
+        task_name,
+        "/TR",
+        action,
+        "/SC",
+        "MINUTE",
+        "/MO",
+        str(SYNC_INTERVAL_MINUTES),
+        "/IT",
+        "/RL",
+        "LIMITED",
+        "/F",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(f"Could not register Windows background task:\n{proc.stderr.strip() or proc.stdout.strip()}")
+    print(f"[SUCCESS] Silent background sync registered: {task_name}")
+    print(f"          It runs every {SYNC_INTERVAL_MINUTES} minutes while you are signed in.")
+
+
+def remove_background_task(profile_id: str) -> None:
+    if sys.platform != "win32":
+        return
+    subprocess.run(
+        ["schtasks.exe", "/Delete", "/TN", task_name_for(profile_id), "/F"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def rotate_log(path: Path) -> None:
+    try:
+        if path.exists() and path.stat().st_size > MAX_LOG_BYTES:
+            old = path.with_suffix(".old.log")
+            old.unlink(missing_ok=True)
+            path.replace(old)
+    except OSError:
+        pass
+
+
+def enable_background_logging(profile_id: str) -> None:
+    log_path = local_app_dir() / LOG_DIR_NAME / f"{profile_id}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    rotate_log(log_path)
+    stream = open(log_path, "a", encoding="utf-8", buffering=1)
+    sys.stdout = stream
+    sys.stderr = stream
+    print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] background sync start")
+
+
+def interactive_setup(profiles_path: Path) -> str:
+    print("\nGemini GitHub Sync - add or update a repository")
+    print("This setup window is only for configuration. Normal syncing will be silent.\n")
+    source = input("GitHub repository clone URL (HTTPS or SSH): ").strip()
+    if not source:
+        raise RuntimeError("Repository URL cannot be empty.")
+    branch = input("Branch to mirror [main]: ").strip() or "main"
+    output = input(r"Gemini upload folder (example C:\GeminiUploads\PharmacyRepo): ").strip()
+    if not output:
+        raise RuntimeError("Output folder cannot be empty.")
+
+    pid = profile_id_for(source, branch)
+    profiles = load_profiles(profiles_path)
+    mirror = str(local_app_dir() / MIRROR_DIR_NAME / pid)
+    profiles[pid] = {
+        "source_repo": source,
+        "branch": branch,
+        "output_dir": output,
+        "mirror_dir": mirror,
+    }
+    save_profiles(profiles_path, profiles)
+
+    print(f"\n[setup] Repository profile: {pid}")
+    print("[setup] Performing the first sync now; Git may ask you to sign in once.")
+    sync_profile(pid, profiles[pid], force=True)
+    register_background_task(pid, profiles_path)
+    print("\n[DONE] You can close this window.")
+    print("From now on Windows will refresh this repository silently in the background.")
+    print("Run SetupGeminiRepo.bat again only if you want to add another repository.")
+    return pid
+
+
+def select_profiles(args: argparse.Namespace, profiles: dict[str, dict[str, Any]]) -> list[str]:
+    if args.all:
+        return sorted(profiles)
+    if args.profile:
+        if args.profile not in profiles:
+            raise RuntimeError(f"Unknown profile '{args.profile}'. Run with --list to see configured repositories.")
+        return [args.profile]
+    if len(profiles) == 1:
+        return [next(iter(profiles))]
+    if not profiles:
+        raise RuntimeError("No repositories are configured. Run SetupGeminiRepo.bat first.")
+    raise RuntimeError("More than one repository is configured. Use --profile <id> or --all.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Keep GitHub repositories mirrored into clean Gemini upload folders.")
+    p.add_argument("--setup", action="store_true", help="Interactively add/update a repository and install its background task.")
+    p.add_argument("--config", help="Override profiles JSON path.")
+    p.add_argument("--profile", help="Synchronize one configured repository profile.")
+    p.add_argument("--all", action="store_true", help="Synchronize all configured repositories.")
+    p.add_argument("--list", action="store_true", help="List configured repository profiles.")
+    p.add_argument("--force", action="store_true", help="Rebuild output even if GitHub commit is unchanged.")
+    p.add_argument("--reclone", action="store_true", help="Recreate only the selected disposable mirror clone.")
+    p.add_argument("--background", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--install-task", metavar="PROFILE", help="Install/update the Windows background task for a profile.")
+    p.add_argument("--remove-task", metavar="PROFILE", help="Remove the Windows background task for a profile.")
     return p
 
 
 def main() -> int:
-    if sys.platform == "win32":
+    global BACKGROUND_MODE
+    args = build_parser().parse_args()
+    BACKGROUND_MODE = bool(args.background)
+    profiles_path = expand_path(args.config) if args.config else default_profiles_path()
+
+    if sys.platform == "win32" and not BACKGROUND_MODE:
         try:
             sys.stdout.reconfigure(encoding="utf-8")
             sys.stderr.reconfigure(encoding="utf-8")
         except Exception:
             pass
 
-    args = build_parser().parse_args()
-    config_path = expand_path(args.config) if args.config else default_config_path()
+    if BACKGROUND_MODE and args.profile:
+        enable_background_logging(args.profile)
 
     try:
         if args.setup:
-            interactive_setup(config_path)
+            interactive_setup(profiles_path)
             return 0
 
-        if args.watch is None:
-            return sync_once(args)
+        profiles = load_profiles(profiles_path)
 
-        interval = max(30, args.watch)
-        print(f"[watch] Checking GitHub every {interval} seconds. Press Ctrl+C to stop.")
-        while True:
+        if args.list:
+            if not profiles:
+                print("No repositories configured.")
+                return 0
+            for pid, profile in sorted(profiles.items()):
+                print(f"{pid}\n  {profile.get('source_repo')} [{profile.get('branch', 'main')}]\n  -> {profile.get('output_dir')}")
+            return 0
+
+        if args.install_task:
+            if args.install_task not in profiles:
+                raise RuntimeError(f"Unknown profile '{args.install_task}'.")
+            register_background_task(args.install_task, profiles_path)
+            return 0
+
+        if args.remove_task:
+            remove_background_task(args.remove_task)
+            print(f"Background task removed for {args.remove_task}.")
+            return 0
+
+        selected = select_profiles(args, profiles)
+        failures = 0
+        for pid in selected:
             try:
-                sync_once(args)
+                sync_profile(pid, profiles[pid], force=args.force, reclone=args.reclone)
             except Exception as exc:
-                print(f"[WARNING] Sync failed: {exc}", file=sys.stderr)
-            time.sleep(interval)
+                failures += 1
+                print(f"[ERROR] {pid}: {exc}", file=sys.stderr)
+        return 1 if failures else 0
     except KeyboardInterrupt:
-        print("\n[stopped] GitHub watch stopped.")
-        return 0
+        return 130
     except Exception as exc:
         print(f"\n[ERROR] {exc}", file=sys.stderr)
         return 1
