@@ -858,6 +858,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true", help="Rebuild output even if GitHub commit is unchanged.")
     p.add_argument("--reclone", action="store_true", help="Recreate only the selected disposable mirror clone.")
     p.add_argument("--background", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--refresh-runtime", action="store_true", help="Update the installed silent background runtime from this copy.")
     p.add_argument("--install-task", metavar="PROFILE", help="Install/update the Windows background task for a profile.")
     p.add_argument("--remove-task", metavar="PROFILE", help="Remove the Windows background task for a profile.")
     return p
@@ -885,6 +886,10 @@ def main() -> int:
             return 0
 
         profiles = load_profiles(profiles_path)
+
+        if args.refresh_runtime:
+            runtime = install_runtime_copy()
+            print(f"[SUCCESS] Background runtime updated: {runtime}")
 
         if args.list:
             if not profiles:
