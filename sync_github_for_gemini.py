@@ -355,6 +355,25 @@ def gemini_bundle_output_dir(profile: dict[str, Any], exact_output: Path) -> Pat
     return exact_output.with_name(exact_output.name + "-Gemini")
 
 
+def validate_separate_outputs(exact_output: Path, gemini_output: Path) -> None:
+    exact_output = exact_output.resolve()
+    gemini_output = gemini_output.resolve()
+    if exact_output == gemini_output:
+        raise RuntimeError("Gemini bundle output must be different from the exact mirror output.")
+    try:
+        gemini_output.relative_to(exact_output)
+    except ValueError:
+        pass
+    else:
+        raise RuntimeError("Gemini bundle output cannot be inside the exact mirror output.")
+    try:
+        exact_output.relative_to(gemini_output)
+    except ValueError:
+        pass
+    else:
+        raise RuntimeError("Exact mirror output cannot be inside the Gemini bundle output.")
+
+
 def gemini_excluded_top_level(profile: dict[str, Any]) -> set[str]:
     configured = profile.get("gemini_excluded_dirs")
     if configured is None:
@@ -443,7 +462,8 @@ def materialize_gemini_bundles(
     target_bytes: int = GEMINI_BUNDLE_TARGET_BYTES,
 ) -> dict[str, Any]:
     """Create Gemini-friendly plain-text bundles from Git-tracked repository content."""
-    excluded = {item.lower() for item in (excluded_top_level or DEFAULT_GEMINI_EXCLUDED_TOP_LEVEL)}
+    selected_exclusions = DEFAULT_GEMINI_EXCLUDED_TOP_LEVEL if excluded_top_level is None else excluded_top_level
+    excluded = {item.lower() for item in selected_exclusions}
     categories: dict[str, list[tuple[str, str]]] = {key: [] for key in BUNDLE_CATEGORY_PREFIXES}
     skipped: list[tuple[str, str]] = []
 
@@ -525,7 +545,7 @@ def materialize_gemini_bundles(
             f"Included text files: {len(included_mapping)}",
             f"Skipped files: {len(skipped)}",
             f"Bundle files: {len(bundle_records)}",
-            f"Default excluded top-level directories: {', '.join(sorted(excluded)) or '(none)'}",
+            f"Excluded top-level directories: {', '.join(sorted(excluded)) or '(none)'}",
             "",
             "BUNDLES",
         ]
@@ -573,8 +593,7 @@ def profile_paths(profile_id: str, profile: dict[str, Any]) -> tuple[str, str, P
 def sync_profile(profile_id: str, profile: dict[str, Any], *, force: bool = False, reclone: bool = False) -> int:
     source, branch, output, mirror, state_path, lock_path = profile_paths(profile_id, profile)
     gemini_output = gemini_bundle_output_dir(profile, output)
-    if gemini_output == output:
-        raise RuntimeError("Gemini bundle output must be different from the exact mirror output.")
+    validate_separate_outputs(output, gemini_output)
     validate_output_dir(gemini_output, mirror)
 
     with sync_lock(lock_path):
