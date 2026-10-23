@@ -36,6 +36,7 @@ SYNC_INTERVAL_MINUTES = 2
 MAX_UPLOAD_FILE_BYTES = 100 * 1024 * 1024
 MAX_LOG_BYTES = 2 * 1024 * 1024
 BACKGROUND_GIT_TIMEOUT_SECONDS = 90
+MAX_SCHTASKS_ACTION_CHARS = 262
 
 BACKGROUND_MODE = False
 
@@ -468,6 +469,12 @@ def register_background_task(profile_id: str, profiles_path: Path) -> None:
     launcher = write_hidden_launcher(profile_id, profiles_path, pythonw, runtime_script)
     task_name = task_name_for(profile_id)
     action = build_task_action(launcher)
+    if len(action) > MAX_SCHTASKS_ACTION_CHARS:
+        raise RuntimeError(
+            "Windows Task Scheduler cannot store the background launcher because its path is too long. "
+            f"Task action length is {len(action)} characters; limit is {MAX_SCHTASKS_ACTION_CHARS}. "
+            "Move the Windows user profile/local-app-data path to a shorter location or configure a shorter runtime path."
+        )
     cmd = build_task_registration_args(task_name, action)
     proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
     if proc.returncode != 0:
