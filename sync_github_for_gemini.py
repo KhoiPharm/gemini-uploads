@@ -684,8 +684,9 @@ def materialize_gemini_start(
             "1. Read 01_REPOSITORY_INDEX.txt and 02_CORE_CONTEXT.txt.\n"
             "2. Identify the exact repository files needed for the current task.\n"
             "3. Use the index to find which bundle contains each required file.\n"
-            "4. Ask the user to upload only those bundle file(s) from the sibling '-Gemini' folder.\n"
-            "5. Prefer the smallest set of bundles necessary for the task.\n\n"
+            "4. Ask the user to add only those bundle file(s) from the sibling '-Gemini' folder.\n"
+            "5. Prefer the smallest set of bundles necessary for the task.\n"
+            "6. If a shared Google Drive workspace is configured, use Add from Drive and select the requested files there.\n\n"
             "The bundle files preserve original repository paths and exact source text.\n"
         )
         (staging / "00_START_HERE.txt").write_text(guide, encoding="utf-8", newline="\n")
