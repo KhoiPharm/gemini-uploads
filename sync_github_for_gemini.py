@@ -1065,6 +1065,74 @@ def interactive_setup(profiles_path: Path) -> str:
     return pid
 
 
+def select_profile_for_configuration(
+    profiles: dict[str, dict[str, Any]],
+    requested_profile: str | None = None,
+) -> str:
+    if requested_profile:
+        if requested_profile not in profiles:
+            raise RuntimeError(f"Unknown profile '{requested_profile}'. Run with --list to see configured repositories.")
+        return requested_profile
+    if len(profiles) == 1:
+        return next(iter(profiles))
+    if not profiles:
+        raise RuntimeError("No repositories are configured. Run SetupGeminiRepo.bat first.")
+
+    ordered = sorted(profiles)
+    print("\nMore than one repository is configured:")
+    for index, pid in enumerate(ordered, start=1):
+        profile = profiles[pid]
+        print(
+            f"  {index}. {safe_slug(str(profile.get('source_repo') or pid))} "
+            f"[{profile.get('branch', 'main')}]"
+        )
+    choice = input("Choose the repository number for this Drive workspace: ").strip()
+    try:
+        selected = int(choice)
+    except ValueError as exc:
+        raise RuntimeError("Repository selection must be a number.") from exc
+    if selected < 1 or selected > len(ordered):
+        raise RuntimeError("Repository selection is out of range.")
+    return ordered[selected - 1]
+
+
+def configure_drive_workspace(
+    profiles_path: Path,
+    workspace_value: str,
+    requested_profile: str | None = None,
+) -> str:
+    workspace = expand_path(workspace_value)
+    if not workspace.exists() or not workspace.is_dir():
+        raise RuntimeError(
+            "The selected Google Drive workspace is not available as a local folder. "
+            "Open Google Drive for Desktop, wait for it to appear in File Explorer, then try again."
+        )
+
+    profiles = load_profiles(profiles_path)
+    pid = select_profile_for_configuration(profiles, requested_profile)
+    profile = profiles[pid]
+    profile["drive_workspace_dir"] = str(workspace)
+    profiles[pid] = profile
+    save_profiles(profiles_path, profiles)
+
+    # Refresh the installed scheduled-task runtime so background sync immediately
+    # understands the new optional Drive destination. The task definition itself
+    # does not change.
+    install_runtime_copy()
+
+    print(f"\n[Drive setup] Repository profile: {pid}")
+    print(f"[Drive setup] Workspace: {workspace}")
+    print("[Drive setup] Existing local mirror/starter/bundles will be preserved.")
+    sync_profile(pid, profile, force=True)
+
+    drive_start, drive_bundles = drive_output_dirs(workspace)
+    print("\n[DONE] Google Drive is now an additional synchronized destination.")
+    print(f"[Drive] Starter: {drive_start}")
+    print(f"[Drive] Bundles: {drive_bundles}")
+    print("Your original local folders continue to update as before.")
+    return pid
+
+
 def select_profiles(args: argparse.Namespace, profiles: dict[str, dict[str, Any]]) -> list[str]:
     if args.all:
         return sorted(profiles)
@@ -1090,6 +1158,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reclone", action="store_true", help="Recreate only the selected disposable mirror clone.")
     p.add_argument("--background", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--refresh-runtime", action="store_true", help="Update the installed silent background runtime from this copy.")
+    p.add_argument("--configure-drive", metavar="FOLDER", help="Add a Google Drive for Desktop workspace as a second output destination.")
     p.add_argument("--install-task", metavar="PROFILE", help="Install/update the Windows background task for a profile.")
     p.add_argument("--remove-task", metavar="PROFILE", help="Remove the Windows background task for a profile.")
     return p
@@ -1118,6 +1187,10 @@ def main() -> int:
 
         profiles = load_profiles(profiles_path)
 
+        if args.configure_drive:
+            configure_drive_workspace(profiles_path, args.configure_drive, args.profile)
+            return 0
+
         if args.refresh_runtime:
             runtime = install_runtime_copy()
             print(f"[SUCCESS] Background runtime updated: {runtime}")
@@ -1130,10 +1203,12 @@ def main() -> int:
                 exact = expand_path(str(profile.get("output_dir") or ""))
                 gemini = gemini_bundle_output_dir(profile, exact)
                 starter = gemini_start_output_dir(profile, exact)
+                drive = drive_workspace_dir(profile)
                 print(
                     f"{pid}\n  {redact_remote_credentials(str(profile.get('source_repo') or ''))} "
                     f"[{profile.get('branch', 'main')}]\n  exact -> {exact}\n"
                     f"  starter -> {starter}\n  bundles -> {gemini}"
+                    + (f"\n  Drive -> {drive}" if drive is not None else "")
                 )
             return 0
 
