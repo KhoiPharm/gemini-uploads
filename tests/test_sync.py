@@ -34,6 +34,7 @@ class SyncTests(unittest.TestCase):
         self.output = self.root / "Gemini upload output"
         self.gemini_output = self.root / "Gemini upload output-Gemini"
         self.gemini_start = self.root / "Gemini upload output-Gemini-Start"
+        self.drive_workspace = self.root / "Google Drive" / "Pharmacy AI Workspace"
         self.config = self.root / "profiles config.json"
 
         subprocess.run(["git", "init", "--bare", str(self.remote)], check=True, capture_output=True)
@@ -108,7 +109,8 @@ class SyncTests(unittest.TestCase):
         ])
         guide = (self.gemini_start / "00_START_HERE.txt").read_text(encoding="utf-8")
         self.assertIn("Do NOT ask the user to upload the whole repository ZIP", guide)
-        self.assertIn("upload only those bundle file(s)", guide)
+        self.assertIn("add only those bundle file(s)", guide)
+        self.assertIn("use Add from Drive", guide)
         index = (self.gemini_start / "01_REPOSITORY_INDEX.txt").read_text(encoding="utf-8")
         self.assertIn("src/app.py", index)
         core = (self.gemini_start / "02_CORE_CONTEXT.txt").read_text(encoding="utf-8")
@@ -209,6 +211,104 @@ class SyncTests(unittest.TestCase):
         self.assertIn("src/app.py", index)
         self.assertIn("README.md", index)
         self.assertTrue(all(path.suffix == ".txt" for path in bundle_output.iterdir()))
+
+    def enable_drive_for_profile(self) -> None:
+        self.drive_workspace.mkdir(parents=True, exist_ok=True)
+        profiles = json.loads(self.config.read_text(encoding="utf-8"))["profiles"]
+        profiles[self.profile]["drive_workspace_dir"] = str(self.drive_workspace)
+        self.write_profiles(profiles)
+
+    def test_drive_is_optional_and_local_outputs_still_exist(self) -> None:
+        result = self.run_sync()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.output.is_dir())
+        self.assertTrue(self.gemini_output.is_dir())
+        self.assertTrue(self.gemini_start.is_dir())
+        self.assertFalse((self.drive_workspace / sync.DRIVE_START_FOLDER_NAME).exists())
+        self.assertFalse((self.drive_workspace / sync.DRIVE_BUNDLES_FOLDER_NAME).exists())
+
+    def test_drive_workspace_receives_second_copy_without_replacing_local_outputs(self) -> None:
+        self.enable_drive_for_profile()
+        shared_notes = self.drive_workspace / "Shared Notes"
+        shared_notes.mkdir()
+        (shared_notes / "keep.txt").write_text("do not touch\n", encoding="utf-8")
+
+        result = self.run_sync()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        drive_start = self.drive_workspace / sync.DRIVE_START_FOLDER_NAME
+        drive_bundles = self.drive_workspace / sync.DRIVE_BUNDLES_FOLDER_NAME
+        self.assertTrue((drive_start / "00_START_HERE.txt").is_file())
+        self.assertTrue((drive_bundles / "00_REPOSITORY_INDEX.txt").is_file())
+        self.assertEqual(
+            (drive_start / "00_START_HERE.txt").read_text(encoding="utf-8"),
+            (self.gemini_start / "00_START_HERE.txt").read_text(encoding="utf-8"),
+        )
+        self.assertTrue((self.output / "src" / "app.py").is_file())
+        self.assertTrue((self.gemini_output / "00_REPOSITORY_INDEX.txt").is_file())
+        self.assertEqual((shared_notes / "keep.txt").read_text(encoding="utf-8"), "do not touch\n")
+
+    def test_drive_missing_file_is_repaired_on_unchanged_commit(self) -> None:
+        self.enable_drive_for_profile()
+        first = self.run_sync()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        drive_start = self.drive_workspace / sync.DRIVE_START_FOLDER_NAME
+        missing = drive_start / "00_START_HERE.txt"
+        missing.unlink()
+
+        second = self.run_sync()
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertTrue(missing.is_file())
+        self.assertNotIn("[up to date]", second.stdout)
+
+    def test_drive_stale_generated_file_is_removed_but_workspace_siblings_survive(self) -> None:
+        self.enable_drive_for_profile()
+        first = self.run_sync()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        drive_bundles = self.drive_workspace / sync.DRIVE_BUNDLES_FOLDER_NAME
+        stale = drive_bundles / "old-generated.txt"
+        stale.write_text("stale\n", encoding="utf-8")
+        notes = self.drive_workspace / "Shared Notes"
+        notes.mkdir()
+        note = notes / "human-note.txt"
+        note.write_text("preserve\n", encoding="utf-8")
+
+        second = self.run_sync("--force")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertFalse(stale.exists())
+        self.assertEqual(note.read_text(encoding="utf-8"), "preserve\n")
+
+    def test_configure_drive_workspace_saves_path_refreshes_runtime_and_syncs(self) -> None:
+        self.drive_workspace.mkdir(parents=True)
+        appdata = self.root / "appdata"
+        runtime = appdata / "runtime" / "sync_github_for_gemini.py"
+        with mock.patch.object(sync, "local_app_dir", return_value=appdata), mock.patch.object(
+            sync, "install_runtime_copy", return_value=runtime
+        ) as install_runtime:
+            pid = sync.configure_drive_workspace(
+                self.config,
+                str(self.drive_workspace),
+                self.profile,
+            )
+        self.assertEqual(pid, self.profile)
+        install_runtime.assert_called_once()
+        profiles = json.loads(self.config.read_text(encoding="utf-8"))["profiles"]
+        self.assertEqual(
+            Path(profiles[self.profile]["drive_workspace_dir"]),
+            self.drive_workspace.resolve(),
+        )
+        self.assertTrue((self.drive_workspace / sync.DRIVE_START_FOLDER_NAME / "00_START_HERE.txt").is_file())
+        self.assertTrue((self.drive_workspace / sync.DRIVE_BUNDLES_FOLDER_NAME / "00_REPOSITORY_INDEX.txt").is_file())
+        self.assertTrue(self.gemini_start.is_dir())
+        self.assertTrue(self.gemini_output.is_dir())
+
+    def test_drive_workspace_cannot_be_nested_inside_local_generated_outputs(self) -> None:
+        profiles = json.loads(self.config.read_text(encoding="utf-8"))["profiles"]
+        profiles[self.profile]["drive_workspace_dir"] = str(self.gemini_output / "Drive Workspace")
+        self.write_profiles(profiles)
+        result = self.run_sync()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot be nested", result.stderr)
 
     def test_nested_unicode_and_spaces_are_exported(self) -> None:
         (self.work / "資料 folder").mkdir()

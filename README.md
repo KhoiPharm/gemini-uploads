@@ -123,6 +123,55 @@ The repository index records every skipped path and reason.
 
 It does not exclude source merely because filenames contain domain words such as `patient`, `pharmacy`, or `prescription`.
 
+## Optional shared Google Drive workspace
+
+Google Drive is an **additional destination**, not a replacement for the local outputs above.
+
+After the normal repository setup is working:
+
+1. Install/sign in to Google Drive for Desktop.
+2. Make the Drive folder named `Pharmacy AI Workspace` visible in File Explorer.
+3. Double-click:
+
+```text
+UseGoogleDrive.bat
+```
+
+4. A Windows folder picker opens. Select the local Google Drive for Desktop copy of:
+
+```text
+Pharmacy AI Workspace
+```
+
+The utility saves only that local filesystem path in the private profile under `%LOCALAPPDATA%\GeminiRepoSync`. It does not commit the path to this public repository.
+
+Every normal background sync then continues producing the existing local folders **and also** mirrors these generated folders into Drive:
+
+```text
+Pharmacy AI Workspace\
+├── Gemini Start\
+├── Gemini Bundles\
+└── Shared Notes\       <- never touched by the synchronizer
+```
+
+Only `Gemini Start` and `Gemini Bundles` are managed by the synchronizer. Files elsewhere in the Drive workspace, including `Shared Notes`, are outside its write boundary.
+
+The Drive folders are updated **in place** rather than being replaced as whole directories. This is intentional so their Google Drive folder identities remain stable.
+
+If Drive for Desktop is temporarily offline, unavailable, or locked, the local outputs remain intact. A later scheduled run retries the Drive copy.
+
+This gives two parallel ways to work:
+
+```text
+Local fallback:
+PharmacyRepo-Gemini-Start / PharmacyRepo-Gemini
+
+Shared Drive:
+Pharmacy AI Workspace / Gemini Start / Gemini Bundles
+```
+
+For Gemini, prefer **Add from Drive** and start with files from `Gemini Start`. The starter index then identifies the smaller bundle files needed for the current task.
+
 ## Requirements
 
 - Windows 11
