@@ -40,6 +40,9 @@ MAX_SCHTASKS_ACTION_CHARS = 262
 GEMINI_BUNDLE_VERSION = 2
 GEMINI_BUNDLE_TARGET_BYTES = 256 * 1024
 GEMINI_START_VERSION = 1
+DRIVE_EXPORT_VERSION = 1
+DRIVE_START_FOLDER_NAME = "Gemini Start"
+DRIVE_BUNDLES_FOLDER_NAME = "Gemini Bundles"
 START_CONTEXT_MAX_BYTES = 192 * 1024
 START_CONTEXT_BASENAMES = {
     "readme.md",
@@ -371,6 +374,15 @@ def gemini_start_output_dir(profile: dict[str, Any], exact_output: Path) -> Path
     return exact_output.with_name(exact_output.name + "-Gemini-Start")
 
 
+def drive_workspace_dir(profile: dict[str, Any]) -> Path | None:
+    configured = str(profile.get("drive_workspace_dir") or "").strip()
+    return expand_path(configured) if configured else None
+
+
+def drive_output_dirs(workspace: Path) -> tuple[Path, Path]:
+    return workspace / DRIVE_START_FOLDER_NAME, workspace / DRIVE_BUNDLES_FOLDER_NAME
+
+
 def validate_output_layout(*outputs: Path) -> None:
     resolved = [path.resolve() for path in outputs]
     for index, left in enumerate(resolved):
@@ -464,6 +476,56 @@ def _promote_generated_directory(staging: Path, output: Path) -> None:
         except OSError as exc:
             print(f"[WARNING] New Gemini bundles are ready; old bundle cleanup will retry later: {exc}")
     cleanup_stale_backups(output)
+
+
+def sync_generated_directory_in_place(source: Path, destination: Path) -> int:
+    """Mirror generated files into a Drive folder without replacing the folder itself."""
+    if not source.is_dir():
+        raise RuntimeError(f"Generated source folder is missing: {source}")
+    destination.mkdir(parents=True, exist_ok=True)
+
+    source_files = {
+        path.relative_to(source)
+        for path in source.rglob("*")
+        if path.is_file()
+    }
+    temp_paths: list[Path] = []
+    copied = 0
+    try:
+        for rel in sorted(source_files, key=lambda item: str(item).lower()):
+            src = source / rel
+            dst = destination / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            temp = dst.with_name(dst.name + f".GeminiRepoSync-{uuid.uuid4().hex[:8]}.tmp")
+            temp_paths.append(temp)
+            shutil.copy2(src, temp)
+            os.replace(temp, dst)
+            copied += 1
+
+        for existing in sorted(
+            (path for path in destination.rglob("*") if path.is_file()),
+            key=lambda path: len(path.parts),
+            reverse=True,
+        ):
+            rel = existing.relative_to(destination)
+            if rel in source_files:
+                continue
+            existing.unlink()
+
+        for directory in sorted(
+            (path for path in destination.rglob("*") if path.is_dir()),
+            key=lambda path: len(path.parts),
+            reverse=True,
+        ):
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+    finally:
+        for temp in temp_paths:
+            temp.unlink(missing_ok=True)
+
+    return copied
 
 
 def materialize_gemini_bundles(
@@ -687,13 +749,23 @@ def sync_profile(profile_id: str, profile: dict[str, Any], *, force: bool = Fals
     source, branch, output, mirror, state_path, lock_path = profile_paths(profile_id, profile)
     gemini_output = gemini_bundle_output_dir(profile, output)
     gemini_start = gemini_start_output_dir(profile, output)
-    validate_output_layout(output, gemini_output, gemini_start)
+    drive_workspace = drive_workspace_dir(profile)
+    drive_start: Path | None = None
+    drive_bundles: Path | None = None
+
+    outputs = [output, gemini_output, gemini_start]
+    if drive_workspace is not None:
+        drive_start, drive_bundles = drive_output_dirs(drive_workspace)
+        outputs.extend([drive_start, drive_bundles])
+
+    validate_output_layout(*outputs)
     validate_output_dir(gemini_output, mirror)
     validate_output_dir(gemini_start, mirror)
+    if drive_start is not None and drive_bundles is not None:
+        validate_output_dir(drive_start, mirror)
+        validate_output_dir(drive_bundles, mirror)
 
     with sync_lock(lock_path):
-        # Retry local cleanup even when GitHub has not changed. This matters
-        # when Drive/Explorer temporarily locked an old backup on a prior run.
         cleanup_stale_backups(output)
         cleanup_stale_backups(gemini_output)
         cleanup_stale_backups(gemini_start)
@@ -714,10 +786,21 @@ def sync_profile(profile_id: str, profile: dict[str, Any], *, force: bool = Fals
             and state.get("start_version") == GEMINI_START_VERSION
             and bundle_current
         )
-        if not force and exact_current and bundle_current and start_current:
+        drive_current = drive_workspace is None or (
+            drive_start is not None
+            and drive_bundles is not None
+            and drive_start.exists()
+            and drive_bundles.exists()
+            and state.get("drive_head_sha") == head
+            and state.get("drive_export_version") == DRIVE_EXPORT_VERSION
+        )
+
+        if not force and exact_current and bundle_current and start_current and drive_current:
             print(f"[up to date] {profile_id}: {branch} @ {head[:12]}")
             print(f"[Gemini starter] {gemini_start}")
             print(f"[Gemini bundles] {gemini_output}")
+            if drive_workspace is not None:
+                print(f"[Drive workspace] {drive_workspace}")
             return 0
 
         if force or not exact_current:
@@ -750,26 +833,51 @@ def sync_profile(profile_id: str, profile: dict[str, Any], *, force: bool = Fals
                 "context_bytes": state.get("gemini_start_context_bytes", 0),
             }
 
-        write_json_atomic(
-            state_path,
-            {
-                "profile_id": profile_id,
-                "source_repo": source,
-                "branch": branch,
-                "head_sha": head,
-                "output_dir": str(output),
-                "gemini_output_dir": str(gemini_output),
-                "gemini_start_output_dir": str(gemini_start),
-                "bundle_version": GEMINI_BUNDLE_VERSION,
-                "start_version": GEMINI_START_VERSION,
-                "gemini_included_files": bundle_stats["included_files"],
-                "gemini_skipped_files": bundle_stats["skipped_files"],
-                "gemini_bundle_files": bundle_stats["bundle_files"],
-                "gemini_start_context_files": start_stats["context_files"],
-                "gemini_start_context_bytes": start_stats["context_bytes"],
-                "synced_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            },
-        )
+        drive_stats: dict[str, Any] | None = None
+        if drive_workspace is not None and drive_start is not None and drive_bundles is not None:
+            if force or not drive_current:
+                start_file_count = sync_generated_directory_in_place(gemini_start, drive_start)
+                bundle_file_count = sync_generated_directory_in_place(gemini_output, drive_bundles)
+                drive_stats = {
+                    "workspace": str(drive_workspace),
+                    "start_files": start_file_count,
+                    "bundle_files": bundle_file_count,
+                }
+            else:
+                drive_stats = {
+                    "workspace": str(drive_workspace),
+                    "start_files": state.get("drive_start_files", 0),
+                    "bundle_files": state.get("drive_bundle_files", 0),
+                }
+
+        state_data: dict[str, Any] = {
+            "profile_id": profile_id,
+            "source_repo": source,
+            "branch": branch,
+            "head_sha": head,
+            "output_dir": str(output),
+            "gemini_output_dir": str(gemini_output),
+            "gemini_start_output_dir": str(gemini_start),
+            "bundle_version": GEMINI_BUNDLE_VERSION,
+            "start_version": GEMINI_START_VERSION,
+            "gemini_included_files": bundle_stats["included_files"],
+            "gemini_skipped_files": bundle_stats["skipped_files"],
+            "gemini_bundle_files": bundle_stats["bundle_files"],
+            "gemini_start_context_files": start_stats["context_files"],
+            "gemini_start_context_bytes": start_stats["context_bytes"],
+            "synced_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        if drive_stats is not None:
+            state_data.update(
+                {
+                    "drive_workspace_dir": drive_stats["workspace"],
+                    "drive_head_sha": head,
+                    "drive_export_version": DRIVE_EXPORT_VERSION,
+                    "drive_start_files": drive_stats["start_files"],
+                    "drive_bundle_files": drive_stats["bundle_files"],
+                }
+            )
+        write_json_atomic(state_path, state_data)
 
         print(f"[SUCCESS] {profile_id} refreshed from GitHub.")
         print(f"[branch] {branch}")
@@ -782,12 +890,15 @@ def sync_profile(profile_id: str, profile: dict[str, Any], *, force: bool = Fals
         )
         print(f"[Gemini starter] {gemini_start}")
         print(f"[Gemini bundles] {gemini_output}")
+        if drive_stats is not None:
+            print(f"[Drive workspace] {drive_stats['workspace']}")
+            print(f"[Drive] {DRIVE_START_FOLDER_NAME}: {drive_stats['start_files']} files")
+            print(f"[Drive] {DRIVE_BUNDLES_FOLDER_NAME}: {drive_stats['bundle_files']} files")
         if oversized:
             print("[WARNING] Files over 100 MB may exceed Gemini's per-file upload limit:")
             for path in oversized:
                 print(f"  - {path}")
         return 0
-
 
 def find_pythonw() -> Path:
     exe = Path(sys.executable).resolve()
