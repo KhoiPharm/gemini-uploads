@@ -791,6 +791,10 @@ def sync_profile(profile_id: str, profile: dict[str, Any], *, force: bool = Fals
             and drive_bundles is not None
             and drive_start.exists()
             and drive_bundles.exists()
+            and (drive_start / "00_START_HERE.txt").is_file()
+            and (drive_bundles / "00_REPOSITORY_INDEX.txt").is_file()
+            and sum(1 for path in drive_start.rglob("*") if path.is_file()) == state.get("drive_start_files")
+            and sum(1 for path in drive_bundles.rglob("*") if path.is_file()) == state.get("drive_bundle_files")
             and state.get("drive_head_sha") == head
             and state.get("drive_export_version") == DRIVE_EXPORT_VERSION
         )
